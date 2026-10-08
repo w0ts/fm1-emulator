@@ -174,7 +174,7 @@ pub struct Bus {
     /// Diagnostics only (`set_mmio_stubs`): otherwise unmapped MMIO ranges
     /// that keep the last word written and read it back (0 before), with a
     /// count of accesses per word. Empty in normal use.
-    mmio_stubs: Vec<(u32, u32, u32)>,
+    mmio_stubs: Vec<(u32, u32, u32, u32)>,
     /// Diagnostics only: bytes the guest wrote to `stub_console`.
     pub stub_console: Option<(u32, Vec<u8>)>,
     stub_words: std::cell::RefCell<std::collections::BTreeMap<u32, (u32, u64)>>,
@@ -373,6 +373,12 @@ impl Bus {
     /// Each range is (low, high, mask): reads return the stored word with
     /// `mask` set (for example a transmitter-ready flag).
     pub fn set_mmio_stubs(&mut self, ranges: Vec<(u32, u32, u32)>) {
+        self.mmio_stubs = ranges.into_iter().map(|(l, h, m)| (l, h, m, 0)).collect();
+    }
+
+    /// `set_mmio_stubs` with a fourth field per range: bits cleared on
+    /// read (for example a start bit that a busy-wait polls back to 0).
+    pub fn set_mmio_stubs_clearing(&mut self, ranges: Vec<(u32, u32, u32, u32)>) {
         self.mmio_stubs = ranges;
     }
 
@@ -385,19 +391,19 @@ impl Bus {
             .collect()
     }
 
-    fn stubbed(&self, address: u32) -> Option<u32> {
+    fn stubbed(&self, address: u32) -> Option<(u32, u32)> {
         self.mmio_stubs
             .iter()
-            .find(|&&(low, high, _)| (low..=high).contains(&address))
-            .map(|&(_, _, mask)| mask)
+            .find(|&&(low, high, _, _)| (low..=high).contains(&address))
+            .map(|&(_, _, set, clear)| (set, clear))
     }
 
     fn stub_read(&self, address: u32) -> Option<u32> {
-        let mask = self.stubbed(address)?;
+        let (set, clear) = self.stubbed(address)?;
         let mut words = self.stub_words.borrow_mut();
         let entry = words.entry(address & !3).or_insert((0, 0));
         entry.1 += 1;
-        Some((entry.0 | mask) >> ((address & 3) * 8))
+        Some(((entry.0 & !clear) | set) >> ((address & 3) * 8))
     }
 
     fn stub_write(&mut self, address: u32, value: u32) -> bool {

@@ -17,6 +17,7 @@ pub mod flash_state;
 mod float;
 pub mod gpio;
 pub mod host_thread;
+pub mod isr_profile;
 pub mod lcd;
 pub mod leds;
 mod package;

@@ -102,18 +102,21 @@ fn run() -> Result<(), String> {
     let stub_ranges = env::var("FM1_STUB_MMIO").ok().map(|list| {
         list.split(',')
             .filter_map(|range| {
-                let (range, mask) = range.split_once(':').unwrap_or((range, "0"));
-                let (low, high) = range.split_once('-')?;
+                // LOW-HIGH[:SET[:CLEAR]]: bits set / cleared on every read.
+                let mut fields = range.split(':');
+                let (low, high) = fields.next()?.split_once('-')?;
+                let hex = |v: &str| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok();
                 Some((
-                    u32::from_str_radix(low.trim_start_matches("0x"), 16).ok()?,
-                    u32::from_str_radix(high.trim_start_matches("0x"), 16).ok()?,
-                    u32::from_str_radix(mask.trim_start_matches("0x"), 16).ok()?,
+                    hex(low)?,
+                    hex(high)?,
+                    hex(fields.next().unwrap_or("0"))?,
+                    hex(fields.next().unwrap_or("0"))?,
                 ))
             })
             .collect::<Vec<_>>()
     });
     if let Some(ranges) = &stub_ranges {
-        cpu.bus.set_mmio_stubs(ranges.clone());
+        cpu.bus.set_mmio_stubs_clearing(ranges.clone());
         // FM1_STUB_CONSOLE=ADDRESS: collect the bytes written there (a
         // debug UART data register inside a stubbed range).
         if let Ok(address) = env::var("FM1_STUB_CONSOLE") {
@@ -167,6 +170,26 @@ fn run() -> Result<(), String> {
         let reads = env::var("FM1_MMIO_READS").is_ok_and(|v| v == "1");
         cpu.bus.start_mmio_trace(ranges, reads, limit);
     }
+    let ble = setup_ble(&mut cpu)?;
+    let mut isr = env::var("FM1_BLE_ISR")
+        .is_ok_and(|v| v == "1")
+        .then(fm1_emu::isr_profile::IsrProfiler::default);
+    // Optional: FM1_PRESS=STEP:COLUMN:ROW:LENGTH[,...] holds a matrix
+    // contact from instruction STEP for LENGTH instructions.
+    let mut presses: Vec<(u64, usize, usize, u64)> = env::var("FM1_PRESS")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .map(|p| {
+                    let f: Vec<u64> = p.split(':').filter_map(|v| v.parse().ok()).collect();
+                    (f.len() == 4)
+                        .then(|| (f[0], f[1] as usize, f[2] as usize, f[3]))
+                        .ok_or("FM1_PRESS needs STEP:COLUMN:ROW:LENGTH")
+                })
+                .collect::<Result<_, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let mut op_pcs = BTreeMap::<u32, u64>::new();
     // Optional: FM1_IDLE_SKIP=0 steps every slot of a core halted in `idle`
     // instead of jumping to the next device event (same guest state).
@@ -197,6 +220,19 @@ fn run() -> Result<(), String> {
                 continue;
             }
         }
+        let mut contacts_changed = false;
+        if let Some(i) = presses.iter().position(|p| p.0 <= step) {
+            let (at, column, row, length) = presses[i];
+            let down = at + length > step;
+            cpu.bus.devices.gpio.press(column, row, down)?;
+            if down {
+                presses[i].0 = at + length;
+                presses[i].3 = 0;
+            } else {
+                presses.remove(i);
+            }
+            contacts_changed = true;
+        }
         let pc = cpu.pc;
         if watch.contains(&pc) && watch_hits < 400 {
             watch_hits += 1;
@@ -219,7 +255,16 @@ fn run() -> Result<(), String> {
         if mmio_window > 0 && step + mmio_window == limit {
             cpu.bus.start_mmio_stats();
         }
-        match cpu.step_next() {
+        // `step` re-checks every interrupt source after a contact changed.
+        let stepped = if contacts_changed {
+            cpu.step()
+        } else {
+            cpu.step_next()
+        };
+        if let Some(profiler) = isr.as_mut() {
+            profiler.observe(&cpu);
+        }
+        match stepped {
             Ok(op) => {
                 if op_filter.as_deref() == Some(op) {
                     *op_pcs.entry(pc).or_default() += 1;
@@ -299,6 +344,12 @@ fn run() -> Result<(), String> {
             cpu.bus.nor_writes(),
             list.join(" ")
         );
+    }
+    if ble {
+        report_ble(&cpu)?;
+    }
+    if let Some(profiler) = &isr {
+        eprint!("{}", profiler.report());
     }
     if stub_ranges.is_some() {
         let report = cpu.bus.mmio_stub_report();
@@ -497,6 +548,116 @@ fn run() -> Result<(), String> {
         Some(error) => Err(error.to_string()),
         None => Err(format!("instruction limit {limit} reached")),
     }
+}
+
+/// FM1_BLE_CENTRAL=script|scan puts the virtual central on the air:
+/// `script` runs FM1_BLE_SCRIPT=PATH (default: the built-in script),
+/// `scan` only scans. FM1_BLE_MODEL=key=value,... sets engine hypotheses
+/// (ble_engine::EngineConfig::apply). Returns whether BLE reporting is on.
+fn setup_ble(cpu: &mut Cpu) -> Result<bool, String> {
+    use fm1_emu::ble_central::{script, Central, CentralConfig, Step};
+    if let Ok(settings) = env::var("FM1_BLE_MODEL") {
+        cpu.bus.ble_engine_mut().config.apply(&settings)?;
+    }
+    let steps = match env::var("FM1_BLE_CENTRAL").as_deref() {
+        Err(_) | Ok("off") => return Ok(env::var("FM1_BLE_MODEL").is_ok()),
+        Ok("scan") => vec![Step::Scan(u32::MAX)],
+        Ok("script") => match env::var("FM1_BLE_SCRIPT") {
+            Ok(path) => {
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+                script::parse(&text)?
+            }
+            Err(_) => script::default_script(),
+        },
+        Ok(other) => return Err(format!("FM1_BLE_CENTRAL={other}: use script, scan or off")),
+    };
+    let mut config = CentralConfig::default();
+    if let Ok(delay) = env::var("FM1_BLE_WINDOW_DELAY_US") {
+        config.window_delay_us = delay
+            .parse()
+            .map_err(|_| "invalid FM1_BLE_WINDOW_DELAY_US")?;
+    }
+    // FM1_BLE_SMP=ignore leaves a Security Request unanswered.
+    config.answer_smp = env::var("FM1_BLE_SMP").map_or(true, |v| v != "ignore");
+    cpu.bus.ble_attach_central(Central::new(config, steps));
+    Ok(true)
+}
+
+fn report_ble(cpu: &Cpu) -> Result<(), String> {
+    let engine = cpu.bus.ble_engine();
+    eprintln!("BLE engine: {:?}", engine.stats);
+    for note in engine.notes() {
+        eprintln!("  model: {note}");
+    }
+    // FM1_BLE_LOG=PATH writes every packet on the virtual air.
+    let log: Vec<String> = engine.air_log().iter().map(|r| r.to_string()).collect();
+    match env::var("FM1_BLE_LOG") {
+        Ok(path) => {
+            std::fs::write(
+                &path,
+                log.join(
+                    "
+",
+                ) + "
+",
+            )
+            .map_err(|e| format!("{path}: {e}"))?;
+            eprintln!(
+                "BLE air log: {} packets saved to {path}",
+                engine.air_count()
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "BLE air log: {} packets (first 40; FM1_BLE_LOG=PATH saves all):",
+                engine.air_count()
+            );
+            for line in log.iter().take(40) {
+                eprintln!("  {line}");
+            }
+        }
+    }
+    let loud = cpu
+        .bus
+        .audio
+        .samples
+        .iter()
+        .filter(|f| **f != [0, 0])
+        .count();
+    eprintln!(
+        "BLE run: {loud} of {} recorded audio frames are not silent",
+        cpu.bus.audio.samples.len()
+    );
+    let Some(central) = cpu.bus.ble_central() else {
+        return Ok(());
+    };
+    for line in central.log() {
+        eprintln!("  central: {line}");
+    }
+    for r in central.results() {
+        eprintln!("  step {:?}: {:?}", r.step, r.outcome);
+    }
+    for n in central.notifications() {
+        eprintln!(
+            "  notification {:.6} handle 0x{:04x}: {:02x?}",
+            n.tick as f64 / 24e6,
+            n.handle,
+            n.value
+        );
+    }
+    if let Some(r) = central.adv_reports().first() {
+        eprintln!(
+            "  first ADV: type {} addr {:02x?} data {:02x?}",
+            r.kind, r.address, r.data
+        );
+    }
+    if let Some(r) = central.scan_responses().first() {
+        eprintln!(
+            "  first SCAN_RSP: addr {:02x?} data {:02x?}",
+            r.address, r.data
+        );
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
