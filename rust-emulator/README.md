@@ -525,3 +525,120 @@ every executed PC with its count. Counts are instructions, not cycles.
 `examples/preset_sweep FIRMWARE OUT_DIR` clicks PRESETS through every preset,
 plays a chord on each and reports silent presets and guest faults; a fault
 reboots and continues from the next preset.
+
+## Bluetooth LE (BLE MIDI) model
+
+The firmware drives the WL82 BLE baseband engine (registers `0x28000-0x28054`,
+a per-link column port and control blocks in the baseband RAM window). The
+emulator has a **behavioural model** of that engine and a **virtual BLE
+central** on a virtual air interface. Nothing here ran against hardware: every
+engine behaviour is a hypothesis built from the fact sheet
+(`docs/BLE-HW-FACTS.md` in the optimist repository, branch `feat/ble-facts`),
+and the code comments cite its sections. Sources: `src/ble_air.rs` (PDUs, CSA
+#1), `src/ble_param.rs` (control block and DMA window), `src/ble_engine/`,
+`src/ble_central/`, `src/isr_profile.rs`.
+
+### What is modelled
+
+- Advertising (ADV_IND on channels 37/38/39 every interval plus a seeded
+  0-10 ms advDelay), SCAN_REQ/SCAN_RSP, CONNECT_IND, and the connected state:
+  connection events on CSA #1 channels from the 24-bit link clock, receive
+  into the RX buffers, SN/NESN and the TX buffer toggle, empty PDUs, event
+  (IRQ 45) and RX (IRQ 29) interrupts, connection-update and channel-map
+  instants, supervision timeout.
+- The central side: scanning, CONNECT_IND, the master clock and hop schedule,
+  LL procedures (version, features, connection update, channel map,
+  terminate), and an L2CAP/ATT client that does MTU exchange, GATT discovery
+  the way CoreBluetooth does, the BLE-MIDI read, CCCD subscribe, writes
+  without response and notifications.
+- Not modelled: the chip's hardware AES block at `0x41200` (see the stub
+  below), encryption, data length extension, radio timing below a microsecond.
+
+### Hypotheses switchable through `FM1_BLE_MODEL`
+
+`FM1_BLE_MODEL=key=value,...` sets engine choices where the fact sheet leaves
+the behaviour open (`EngineConfig::apply`). Flags take `0/1`. Defaults in
+brackets.
+
+| Key | Values | Meaning |
+|---|---|---|
+| `scan_rsp` | `auto`, `software` [`auto`] | The engine answers a SCAN_REQ with TX buffer 1 by itself, or only stores the request |
+| `scan_req_irq` | flag [0] | Also store an answered SCAN_REQ and raise the RX interrupt |
+| `stop_adv` | flag [1] | The engine stops advertising by itself on a CONNECT_IND for it |
+| `adv_irq_on_connect` | flag [1] | Event interrupt at the end of an advertising event cut short by a CONNECT_IND |
+| `store_empty` | flag [1] | New empty PDUs are stored and signalled (0: acknowledged without a buffer or interrupt) |
+| `old_sn` | `drop`, `irq`, `store` [`drop`] | A repeated SN is dropped silently, dropped with IRQ 29, or stored like new data |
+| `rx_count_repeats` | flag [1] | A dropped repeat still updates EVTCOUNT |
+| `event_irq_every_event` | flag [1] | IRQ 45 after every connection event, not only those with a reception |
+| `engine_retransmits` | flag [1] | The engine resends an unacknowledged PDU itself, or sends whatever TXTOG selects |
+| `pairs` | number [1] | Request/response pairs per event while MD is set |
+| `instant_gating` | flag [1] | Interval/offset changes (columns 1/15/4) take effect only at the column-5 instant |
+| `rx_needs_armed` | flag [0] | Store only into an RX buffer whose RXBUFnCNTL bit0 is 0; stock V15 never receives with it on |
+| `seed` | number | Seed of the advDelay generator |
+
+### The virtual central and its variables
+
+Used by `examples/diagnose` (and by `Bus::ble_attach_central` in tests).
+
+| Variable | Effect |
+|---|---|
+| `FM1_BLE_CENTRAL=script\|scan\|off` | `script` runs the central's script, `scan` only scans, unset or `off`: no central (the engine alone) |
+| `FM1_BLE_SCRIPT=PATH` | Script file for `script` (default: the built-in script) |
+| `FM1_BLE_MODEL=key=value,...` | Engine hypotheses, table above (works without a central too) |
+| `FM1_BLE_LOSS=N` | The central misses every Nth peripheral data PDU (retransmission on both sides) |
+| `FM1_BLE_PAIRS=N` | Up to N central/peripheral pairs per event while MD is set (default 1) |
+| `FM1_BLE_SMP=ignore` | Leave an SMP Security Request unanswered (default: answer with Pairing Failed) |
+| `FM1_BLE_WINDOW_DELAY_US=N` | Where in the transmit window the first packet goes |
+| `FM1_BLE_LOG=PATH` | Write every packet on the virtual air to PATH (otherwise the first 40 are printed) |
+| `FM1_BLE_ISR=1` | Report interrupt-handler timing on CPU 0 (handler length in instructions and guest time, delay of IRQ 29/45 entry, share spent in the audio handler IRQ 11). Nesting is off by default, so it cannot say whether 29/45 could preempt audio |
+| `FM1_PRESS=STEP:COLUMN:ROW:LENGTH[,...]` | Hold a panel matrix contact from instruction STEP for LENGTH instructions (a key press, to see notifications) |
+
+A script is one step per line, `#` starts a comment, options are `key=value`
+(`interval`, `latency`, `timeout`, `winsize`, `winoffset`, `hop`, `chmap` in
+hex). Steps: `scan N`, `connect [opts]`, `wait N` (connection events),
+`version`, `features`, `mtu N`, `discover`, `read`, `subscribe`,
+`midi BYTE...` (hex), `notifications N`, `update [opts]`, `chmap HEX`,
+`terminate`, `vanish` (stop transmitting; link loss). The built-in script scans,
+connects, exchanges version/features/MTU, discovers GATT, subscribes, plays a
+note on and off, updates the channel map and interval, and terminates.
+
+### Running the stock V15 firmware
+
+Unchanged stock V15 advertises, connects, is discovered and exchanges MIDI both
+ways under the model. After the CONNECT_IND it uses the unmodelled block at
+`0x41200` (per the fact sheet the chip's hardware AES block), so that block is
+stubbed:
+
+```sh
+cargo build --release --example diagnose
+FM1_BLE_CENTRAL=script FM1_BLE_SMP=ignore FM1_STUB_MMIO=41200-412ff:24 FM1_BLE_LOG=air.txt FM1_BLE_ISR=1 target/release/examples/diagnose FM-1.fwsc 1300000000
+```
+
+`FM1_BLE_SMP=ignore` is needed because the stock firmware sends an SMP Security
+Request, and if the central answers Pairing Failed it terminates the link
+(LL_TERMINATE_IND 0x13) about 300 ms later. The report lists the step results,
+engine counters, the air log and the number of non-silent audio frames.
+
+The ignored integration tests in `tests/ble.rs` run unchanged stock V15
+against the model (they need the firmware, so they are skipped by default):
+
+```sh
+FM1_STOCK_FWSC=/path/to/FM-1.fwsc cargo test --release --test ble -- --ignored
+```
+
+### Tracing and experiment variables (`diagnose`)
+
+| Variable | Effect |
+|---|---|
+| `FM1_MMIO_TRACE=PATH` | Write every MMIO write in `FM1_MMIO_RANGES` to PATH in execution order, one line per access: `step tick pc R\|W address size value [FAULT]`. Needs `FM1_MMIO_RANGES` |
+| `FM1_MMIO_RANGES=LOW-HIGH[,...]` | Hex inclusive address ranges to trace |
+| `FM1_MMIO_READS=1` | Also trace reads, with the value returned |
+| `FM1_MMIO_TRACE_LIMIT=N` | Stop recording after N accesses (default 2,000,000) |
+| `FM1_FLASH_DUMP=PATH` | Save the raw serial flash at the end and list the sectors programmed or erased |
+| `FM1_FLASH_RESTORE=PATH` | Before the first instruction, lay every 4 KiB sector of a dump that differs from the package over the flash (a second boot of the same device) |
+| `FM1_STUB_MMIO=LOW-HIGH[:SET[:CLEAR]][,...]` | Experiments only: unimplemented MMIO in these hex ranges reads back the last word written instead of faulting; SET bits are set and CLEAR bits cleared on every read (`41200-412ff:24` sets bits 2 and 5 on every read). The output lists every stubbed word touched |
+| `FM1_STUB_CONSOLE=ADDRESS` | Collect the bytes written to this address (a debug UART data register inside a stubbed range) and print them as the guest's console |
+
+A stub invents a register the firmware polls; a result that depends on one
+shows what the firmware does if the block behaves that way, not how the chip
+behaves.
