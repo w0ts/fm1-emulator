@@ -577,6 +577,16 @@ fn setup_ble(cpu: &mut Cpu) -> Result<bool, String> {
             .parse()
             .map_err(|_| "invalid FM1_BLE_WINDOW_DELAY_US")?;
     }
+    // FM1_BLE_LOSS=N: the central misses every Nth peripheral PDU;
+    // FM1_BLE_PAIRS=N: up to N central/peripheral pairs per event (MD).
+    for (name, field) in [
+        ("FM1_BLE_LOSS", &mut config.lose_every),
+        ("FM1_BLE_PAIRS", &mut config.max_pairs_per_event),
+    ] {
+        if let Ok(value) = env::var(name) {
+            *field = value.parse().map_err(|_| format!("invalid {name}"))?;
+        }
+    }
     // FM1_BLE_SMP=ignore leaves a Security Request unanswered.
     config.answer_smp = env::var("FM1_BLE_SMP").map_or(true, |v| v != "ignore");
     cpu.bus.ble_attach_central(Central::new(config, steps));
@@ -631,6 +641,12 @@ fn report_ble(cpu: &Cpu) -> Result<(), String> {
     let Some(central) = cpu.bus.ble_central() else {
         return Ok(());
     };
+    if central.lost > 0 {
+        eprintln!(
+            "  central: {} peripheral PDUs lost on purpose (FM1_BLE_LOSS)",
+            central.lost
+        );
+    }
     for line in central.log() {
         eprintln!("  central: {line}");
     }
