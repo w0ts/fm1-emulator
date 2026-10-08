@@ -714,6 +714,7 @@ impl Cpu {
         let pc = self.pc;
         if self.bus.mmio_counting {
             self.bus.pc_hint.set(pc);
+            self.bus.step_hint.set(self.steps);
         }
         let op = if self.idle {
             // Keep shared hardware time and the other core running while this

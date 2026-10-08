@@ -13,6 +13,47 @@ pub struct AccessFault {
 }
 
 #[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    #[test]
+    fn mmio_trace_records_writes_and_read_values_in_range_only() {
+        let mut b = Bus::new(vec![0; 8]).unwrap();
+        b.start_mmio_trace(vec![(0x28000, 0x280ff)], true, 2);
+        b.write(0x28008, 0x46, 4).unwrap();
+        assert_eq!(b.read(0x28008, 4).unwrap(), 0x46);
+        b.write(0x2fc40, 1, 4).unwrap(); // outside the range
+        b.write(RAM, 7, 4).unwrap(); // SRAM is never traced
+        b.write(0x28010, 0x3e, 4).unwrap(); // past the record limit
+        let trace = b.take_mmio_trace().unwrap();
+        assert_eq!(trace.matched, 3);
+        assert_eq!(trace.records.len(), 2);
+        let (w, r) = (trace.records[0], trace.records[1]);
+        assert!(w.write && w.address == 0x28008 && w.value == 0x46 && !w.fault);
+        assert!(!r.write && r.address == 0x28008 && r.value == 0x46 && r.size == 4);
+        assert!(!b.mmio_counting);
+        assert!(b.take_mmio_trace().is_none());
+    }
+    #[test]
+    fn mmio_stubs_are_opt_in_read_back_with_the_mask_and_feed_the_console() {
+        let mut b = Bus::new(vec![0; 8]).unwrap();
+        assert!(
+            b.write(0x12f00, 1, 4).is_err(),
+            "unmapped MMIO must stay visible"
+        );
+        b.set_mmio_stubs(vec![(0x12200, 0x122ff, 0x8000)]);
+        b.stub_console = Some((0x1220c, Vec::new()));
+        b.write(0x12200, 0x2011, 2).unwrap();
+        assert_eq!(b.read(0x12200, 2).unwrap() & 0xffff, 0xa011);
+        b.write(0x1220c, b'o' as u32, 1).unwrap();
+        b.write(0x1220c, b'k' as u32, 1).unwrap();
+        assert_eq!(b.stub_console.as_ref().unwrap().1, b"ok");
+        assert!(b.read(0x12f00, 4).is_err());
+        let report = b.mmio_stub_report();
+        assert_eq!(report[0], (0x12200, 0x2011, 2));
+    }
+}
+
+#[cfg(test)]
 mod dma_tests {
     use super::*;
     #[test]
@@ -126,6 +167,17 @@ pub struct Bus {
     pub(crate) mmio_counting: bool,
     /// PC of the instruction executing, kept while counting MMIO accesses.
     pub(crate) pc_hint: std::cell::Cell<u32>,
+    /// Instruction count of the instruction executing, kept like `pc_hint`.
+    pub(crate) step_hint: std::cell::Cell<u64>,
+    /// Diagnostics: an ordered log of MMIO accesses inside chosen ranges.
+    mmio_trace: std::cell::RefCell<Option<MmioTrace>>,
+    /// Diagnostics only (`set_mmio_stubs`): otherwise unmapped MMIO ranges
+    /// that keep the last word written and read it back (0 before), with a
+    /// count of accesses per word. Empty in normal use.
+    mmio_stubs: Vec<(u32, u32, u32)>,
+    /// Diagnostics only: bytes the guest wrote to `stub_console`.
+    pub stub_console: Option<(u32, Vec<u8>)>,
+    stub_words: std::cell::RefCell<std::collections::BTreeMap<u32, (u32, u64)>>,
     perf: crate::perf::Perf,
     /// No interrupt source was pending at the last `irq_possible` and no
     /// device state has changed since: the bus clears it whenever its own
@@ -136,6 +188,49 @@ pub struct Bus {
 
 /// MMIO reads and writes per (address, PC of the accessing instruction).
 pub type MmioStats = std::collections::BTreeMap<(u32, u32), [u64; 2]>;
+
+/// One traced MMIO access, in execution order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmioRecord {
+    /// Instructions executed before this access (both cores).
+    pub step: u64,
+    /// Oscillator ticks (24 MHz) at the access.
+    pub tick: u64,
+    /// PC of the accessing instruction.
+    pub pc: u32,
+    /// True for a write.
+    pub write: bool,
+    pub address: u32,
+    pub size: u8,
+    /// Value written, or value returned by a successful read.
+    pub value: u32,
+    /// The access faulted (value is then meaningless).
+    pub fault: bool,
+}
+
+/// Ordered MMIO access log for chosen address ranges (diagnostics).
+#[derive(Debug, Default)]
+pub struct MmioTrace {
+    /// Inclusive address ranges to record.
+    pub ranges: Vec<(u32, u32)>,
+    /// Record reads too (writes are always recorded).
+    pub reads: bool,
+    /// Stop recording after this many records (the count keeps going).
+    pub limit: usize,
+    pub records: Vec<MmioRecord>,
+    /// Accesses that matched, including those past `limit`.
+    pub matched: u64,
+}
+
+impl MmioTrace {
+    fn wants(&self, address: u32, write: bool) -> bool {
+        (write || self.reads)
+            && self
+                .ranges
+                .iter()
+                .any(|&(low, high)| (low..=high).contains(&address))
+    }
+}
 
 impl Bus {
     /// EMU_CON of `core`: exception enables (bit 2 divide by zero).
@@ -236,6 +331,11 @@ impl Bus {
             mmio_stats: Default::default(),
             mmio_counting: false,
             pc_hint: Default::default(),
+            step_hint: Default::default(),
+            mmio_trace: Default::default(),
+            mmio_stubs: Vec::new(),
+            stub_console: None,
+            stub_words: Default::default(),
             perf: Default::default(),
             irq_quiet: false,
         };
@@ -251,8 +351,100 @@ impl Bus {
 
     /// Stop counting and return the counts, if counting was started.
     pub fn take_mmio_stats(&mut self) -> Option<MmioStats> {
-        self.mmio_counting = false;
+        self.mmio_counting = self.mmio_trace.get_mut().is_some();
         self.mmio_stats.get_mut().take()
+    }
+
+    /// Start an ordered MMIO log of `ranges` (inclusive), at most `limit`
+    /// records; `reads` adds reads with their returned values.
+    pub fn start_mmio_trace(&mut self, ranges: Vec<(u32, u32)>, reads: bool, limit: usize) {
+        *self.mmio_trace.get_mut() = Some(MmioTrace {
+            ranges,
+            reads,
+            limit,
+            ..Default::default()
+        });
+        self.mmio_counting = true;
+    }
+
+    /// Diagnostics only: let otherwise unmapped MMIO in `ranges` (inclusive)
+    /// store and return words instead of faulting, to see how far a firmware
+    /// for other hardware gets. Never used by the emulator itself.
+    /// Each range is (low, high, mask): reads return the stored word with
+    /// `mask` set (for example a transmitter-ready flag).
+    pub fn set_mmio_stubs(&mut self, ranges: Vec<(u32, u32, u32)>) {
+        self.mmio_stubs = ranges;
+    }
+
+    /// Stubbed words touched so far: (address, last value, accesses).
+    pub fn mmio_stub_report(&self) -> Vec<(u32, u32, u64)> {
+        self.stub_words
+            .borrow()
+            .iter()
+            .map(|(&a, &(v, n))| (a, v, n))
+            .collect()
+    }
+
+    fn stubbed(&self, address: u32) -> Option<u32> {
+        self.mmio_stubs
+            .iter()
+            .find(|&&(low, high, _)| (low..=high).contains(&address))
+            .map(|&(_, _, mask)| mask)
+    }
+
+    fn stub_read(&self, address: u32) -> Option<u32> {
+        let mask = self.stubbed(address)?;
+        let mut words = self.stub_words.borrow_mut();
+        let entry = words.entry(address & !3).or_insert((0, 0));
+        entry.1 += 1;
+        Some((entry.0 | mask) >> ((address & 3) * 8))
+    }
+
+    fn stub_write(&mut self, address: u32, value: u32) -> bool {
+        if self.stubbed(address).is_none() {
+            return false;
+        }
+        if let Some((console, bytes)) = &mut self.stub_console {
+            if *console == address {
+                bytes.push(value as u8);
+            }
+        }
+        let entry = self
+            .stub_words
+            .get_mut()
+            .entry(address & !3)
+            .or_insert((0, 0));
+        entry.0 = value << ((address & 3) * 8);
+        entry.1 += 1;
+        true
+    }
+
+    /// Stop the MMIO log and return it, if one was started.
+    pub fn take_mmio_trace(&mut self) -> Option<MmioTrace> {
+        self.mmio_counting = self.mmio_stats.get_mut().is_some();
+        self.mmio_trace.get_mut().take()
+    }
+
+    #[cold]
+    fn trace_mmio(&self, address: u32, size: usize, write: bool, result: Result<u32, ()>) {
+        if let Some(trace) = self.mmio_trace.borrow_mut().as_mut() {
+            if !trace.wants(address, write) {
+                return;
+            }
+            trace.matched += 1;
+            if trace.records.len() < trace.limit {
+                trace.records.push(MmioRecord {
+                    step: self.step_hint.get(),
+                    tick: self.oscillator_ticks,
+                    pc: self.pc_hint.get(),
+                    write,
+                    address,
+                    size: size as u8,
+                    value: result.unwrap_or(0),
+                    fault: result.is_err(),
+                });
+            }
+        }
     }
 
     #[inline(always)]
@@ -360,6 +552,24 @@ impl Bus {
 
     #[inline(never)]
     fn read_slow(
+        &self,
+        address: u32,
+        size: usize,
+        operation: &'static str,
+    ) -> Result<u32, AccessFault> {
+        let result = self.read_slow_inner(address, size, operation);
+        if self.mmio_counting && operation == "read" {
+            self.trace_mmio(
+                address,
+                size,
+                false,
+                result.as_ref().map(|v| *v).map_err(|_| ()),
+            );
+        }
+        result
+    }
+
+    fn read_slow_inner(
         &self,
         address: u32,
         size: usize,
@@ -484,6 +694,9 @@ impl Bus {
                     })
                     .map_err(|reason| Self::fault(address, size, operation, reason));
             }
+            if let Some(value) = self.stub_read(address) {
+                return Ok(value);
+            }
             // No generic zero-filled MMIO: missing peripherals must be visible.
             return Err(Self::fault(
                 address,
@@ -551,6 +764,14 @@ impl Bus {
         }
         self.sync()?;
         let result = self.write_mmio(address, value, size);
+        if self.mmio_counting {
+            self.trace_mmio(
+                address,
+                size,
+                true,
+                result.as_ref().map(|_| value).map_err(|_| ()),
+            );
+        }
         self.clocks = self.select_clocks();
         self.next_event = self.oscillator_ticks + 1;
         self.irq_quiet = false;
@@ -687,6 +908,9 @@ impl Bus {
         }
         if let Some(result) = self.devices.write(address, value, size) {
             return result.map_err(|reason| Self::fault(address, size, "write", reason));
+        }
+        if self.stub_write(address, value) {
+            return Ok(());
         }
         let offset = Self::offset(address, size, RAM, self.ram.len()).ok_or_else(|| {
             Self::fault(

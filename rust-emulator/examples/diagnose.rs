@@ -96,6 +96,77 @@ fn run() -> Result<(), String> {
         .unwrap_or(0);
     // Optional: FM1_OP=NAME counts executions per PC of one operation name.
     let op_filter = env::var("FM1_OP").ok();
+    // Optional, experiments only: FM1_STUB_MMIO=LOW-HIGH[,...] (hex) lets
+    // unimplemented MMIO in those ranges read back the last word written
+    // instead of faulting; the output lists every stubbed word touched.
+    let stub_ranges = env::var("FM1_STUB_MMIO").ok().map(|list| {
+        list.split(',')
+            .filter_map(|range| {
+                let (range, mask) = range.split_once(':').unwrap_or((range, "0"));
+                let (low, high) = range.split_once('-')?;
+                Some((
+                    u32::from_str_radix(low.trim_start_matches("0x"), 16).ok()?,
+                    u32::from_str_radix(high.trim_start_matches("0x"), 16).ok()?,
+                    u32::from_str_radix(mask.trim_start_matches("0x"), 16).ok()?,
+                ))
+            })
+            .collect::<Vec<_>>()
+    });
+    if let Some(ranges) = &stub_ranges {
+        cpu.bus.set_mmio_stubs(ranges.clone());
+        // FM1_STUB_CONSOLE=ADDRESS: collect the bytes written there (a
+        // debug UART data register inside a stubbed range).
+        if let Ok(address) = env::var("FM1_STUB_CONSOLE") {
+            let address = u32::from_str_radix(address.trim_start_matches("0x"), 16)
+                .map_err(|_| "invalid FM1_STUB_CONSOLE")?;
+            cpu.bus.stub_console = Some((address, Vec::new()));
+        }
+    }
+    // Optional: FM1_FLASH_RESTORE=PATH (a FM1_FLASH_DUMP from an earlier run)
+    // lays every 4 KiB sector that differs from the package over the flash
+    // before the first instruction, as a second boot of the same device.
+    if let Ok(path) = env::var("FM1_FLASH_RESTORE") {
+        let saved = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+        let current = cpu.bus.nor_bytes().to_vec();
+        if saved.len() != current.len() {
+            return Err(format!("{path}: flash size differs"));
+        }
+        let mut restored = Vec::new();
+        for offset in (0..saved.len()).step_by(4096) {
+            let sector = &saved[offset..offset + 4096];
+            if sector != &current[offset..offset + 4096] {
+                cpu.bus.restore_nor_sector(offset, sector)?;
+                restored.push(format!("0x{offset:06x}"));
+            }
+        }
+        eprintln!("flash: restored sectors [{}]", restored.join(" "));
+    }
+    // Optional: FM1_MMIO_TRACE=PATH writes every MMIO write (and with
+    // FM1_MMIO_READS=1 every read) inside FM1_MMIO_RANGES=LOW-HIGH[,...]
+    // (hex, inclusive) in execution order, at most FM1_MMIO_TRACE_LIMIT
+    // records (default 2,000,000).
+    let mmio_trace_path = env::var("FM1_MMIO_TRACE").ok();
+    if mmio_trace_path.is_some() {
+        let ranges = env::var("FM1_MMIO_RANGES")
+            .map_err(|_| "FM1_MMIO_TRACE needs FM1_MMIO_RANGES")?
+            .split(',')
+            .map(|range| {
+                let (low, high) = range.split_once('-').ok_or("range needs LOW-HIGH")?;
+                let hex = |v: &str| {
+                    u32::from_str_radix(v.trim().trim_start_matches("0x"), 16)
+                        .map_err(|_| "invalid FM1_MMIO_RANGES address")
+                };
+                Ok::<_, &str>((hex(low)?, hex(high)?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let limit = env::var("FM1_MMIO_TRACE_LIMIT")
+            .ok()
+            .map(|v| v.parse().map_err(|_| "invalid FM1_MMIO_TRACE_LIMIT"))
+            .transpose()?
+            .unwrap_or(2_000_000);
+        let reads = env::var("FM1_MMIO_READS").is_ok_and(|v| v == "1");
+        cpu.bus.start_mmio_trace(ranges, reads, limit);
+    }
     let mut op_pcs = BTreeMap::<u32, u64>::new();
     // Optional: FM1_IDLE_SKIP=0 steps every slot of a core halted in `idle`
     // instead of jumping to the next device event (same guest state).
@@ -191,6 +262,58 @@ fn run() -> Result<(), String> {
         }
     }
     stdout.flush().map_err(|e| e.to_string())?;
+    if let (Some(path), Some(trace)) = (&mmio_trace_path, cpu.bus.take_mmio_trace()) {
+        let mut text = String::from("# step tick pc rw address size value\n");
+        for r in &trace.records {
+            text.push_str(&format!(
+                "{} {} {:08x} {} {:05x} {} {:08x}{}\n",
+                r.step,
+                r.tick,
+                r.pc,
+                if r.write { 'W' } else { 'R' },
+                r.address,
+                r.size,
+                r.value,
+                if r.fault { " FAULT" } else { "" }
+            ));
+        }
+        std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
+        eprintln!(
+            "MMIO trace: {} of {} matching accesses saved to {path}",
+            trace.records.len(),
+            trace.matched
+        );
+    }
+    // Optional: FM1_FLASH_DUMP=PATH saves the raw serial flash and reports
+    // the sectors programmed or erased during the run.
+    if let Ok(path) = env::var("FM1_FLASH_DUMP") {
+        std::fs::write(&path, cpu.bus.nor_bytes()).map_err(|e| format!("{path}: {e}"))?;
+        let list: Vec<_> = cpu
+            .bus
+            .nor_tracked_sectors()
+            .iter()
+            .map(|s| format!("0x{s:06x}"))
+            .collect();
+        eprintln!(
+            "flash: {} programs/erases; sectors touched: [{}]; saved {path}",
+            cpu.bus.nor_writes(),
+            list.join(" ")
+        );
+    }
+    if stub_ranges.is_some() {
+        let report = cpu.bus.mmio_stub_report();
+        if let Some((_, bytes)) = &cpu.bus.stub_console {
+            eprintln!("EXPERIMENT: stub console ({} bytes):", bytes.len());
+            eprintln!("{}", String::from_utf8_lossy(bytes));
+        }
+        eprintln!(
+            "EXPERIMENT: {} stubbed MMIO words (FM1_STUB_MMIO):",
+            report.len()
+        );
+        for (address, value, count) in report {
+            eprintln!("  0x{address:08x} = 0x{value:08x} ({count} accesses)");
+        }
+    }
     eprintln!("application: {}", args[0]);
     cpu.bus.sync().map_err(|fault| fault.to_string())?;
     let ticks = cpu.bus.oscillator_ticks();
