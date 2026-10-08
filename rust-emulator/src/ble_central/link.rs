@@ -7,6 +7,9 @@ use super::*;
 use crate::ble_air::{csa1, ll, used_channels};
 use std::collections::VecDeque;
 
+/// Why a connection the central terminated itself ended.
+pub(super) const TERMINATED: &str = "LL_TERMINATE_IND sent and acknowledged";
+
 /// Payload bytes per LL data PDU without the data length extension.
 const LL_PAYLOAD: usize = 27;
 
@@ -129,6 +132,15 @@ impl Central {
     /// The peripheral answered within T_IFS.
     pub fn on_peripheral_pdu(&mut self, now: u64, pdu: &[u8]) {
         self.now = now;
+        self.heard += 1;
+        let every = self.config.lose_every as u64;
+        if every > 0
+            && self.heard.is_multiple_of(every)
+            && self.link.as_ref().is_some_and(|l| l.established)
+        {
+            self.lost += 1;
+            return self.on_no_response(now);
+        }
         let Some(link) = self.link.as_mut() else {
             return;
         };
@@ -162,7 +174,7 @@ impl Central {
             }
         }
         if acked_terminate {
-            self.close("LL_TERMINATE_IND sent and acknowledged".into());
+            self.close(TERMINATED.into());
             return;
         }
         // MD from either side continues the event (Core Vol 6 Part B 4.5.6).

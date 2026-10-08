@@ -50,6 +50,9 @@ pub struct CentralConfig {
     /// Request/response pairs per connection event (MD continues an event
     /// up to this many; 1 = one pair per event).
     pub max_pairs_per_event: u32,
+    /// Loss injection: the central misses every Nth peripheral data-channel
+    /// PDU (0 = none), to exercise retransmission on both sides.
+    pub lose_every: u32,
     /// A step that has not completed after this long fails (ms of guest time).
     pub step_timeout_ms: u32,
 }
@@ -68,6 +71,7 @@ impl Default for CentralConfig {
             features: 0x3E,
             answer_smp: true,
             max_pairs_per_event: 1,
+            lose_every: 0,
             step_timeout_ms: 4_000,
         }
     }
@@ -107,8 +111,13 @@ pub struct Central {
     /// Connection events run, over all connections.
     events: u64,
     closed: Option<String>,
+    /// Advertising reports heard before a `vanish` step.
+    vanished_at_reports: usize,
     log: Vec<String>,
     now: u64,
+    /// Peripheral PDUs heard (for `lose_every`) and lost on purpose.
+    heard: u64,
+    pub lost: u64,
 }
 
 const REPORT_LIMIT: usize = 4_096;
@@ -128,8 +137,11 @@ impl Central {
             gatt: gatt::Gatt::new(mtu),
             events: 0,
             closed: None,
+            vanished_at_reports: 0,
             log: Vec::new(),
             now: 0,
+            heard: 0,
+            lost: 0,
         }
     }
 
@@ -317,7 +329,7 @@ impl Central {
                     (self.now, self.events)
                 }
             };
-            if let Some(outcome) = self.poll_step(start_events) {
+            if let Some(outcome) = self.poll_step(start_tick, start_events) {
                 self.finish_step(outcome);
                 continue;
             }
@@ -336,6 +348,11 @@ impl Central {
     fn start_step(&mut self) -> Result<(), String> {
         let step = self.script[self.step].clone();
         let needs_link = !matches!(step, Step::Scan(_) | Step::Connect(_));
+        if step == Step::Vanish && self.connected() {
+            self.vanished_at_reports = self.adv_reports.len();
+            self.close("the central vanished (no terminate)".into());
+            return Ok(());
+        }
         if needs_link && !self.connected() {
             return Err(match &self.closed {
                 Some(why) => format!("not connected ({why})"),
@@ -343,7 +360,11 @@ impl Central {
             });
         }
         match step {
-            Step::Scan(_) | Step::Connect(_) | Step::Wait(_) | Step::ExpectNotifications(_) => {}
+            Step::Scan(_)
+            | Step::Connect(_)
+            | Step::Wait(_)
+            | Step::ExpectNotifications(_)
+            | Step::Vanish => {}
             Step::Version => self.send_version(),
             Step::Features => self.send_ll(
                 crate::ble_air::ll::FEATURE_REQ,
@@ -380,7 +401,7 @@ impl Central {
         Ok(())
     }
 
-    fn poll_step(&mut self, start_events: u64) -> Option<Result<String, String>> {
+    fn poll_step(&mut self, start_tick: u64, start_events: u64) -> Option<Result<String, String>> {
         let step = self.script[self.step].clone();
         let link = self.link.as_ref();
         let lost = || -> Option<Result<String, String>> {
@@ -389,7 +410,11 @@ impl Central {
                 self.closed.as_deref().unwrap_or("?")
             )))
         };
-        if !matches!(step, Step::Scan(_) | Step::Connect(_) | Step::Terminate) && link.is_none() {
+        if !matches!(
+            step,
+            Step::Scan(_) | Step::Connect(_) | Step::Terminate | Step::Vanish
+        ) && link.is_none()
+        {
             return lost();
         }
         match step {
@@ -430,9 +455,17 @@ impl Central {
                     .is_none()
                     .then(|| Ok(format!("applied, now at event {}", l.event)))
             }
-            Step::Terminate => match link {
-                None => Some(Ok(self.closed.clone().unwrap_or_default())),
-                Some(_) => None,
+            Step::Vanish => (self.adv_reports.len() > self.vanished_at_reports).then(|| {
+                let first = &self.adv_reports[self.vanished_at_reports];
+                Ok(format!(
+                    "advertising again {:.0} ms after the central vanished",
+                    (first.tick - start_tick) as f64 / 24_000.0
+                ))
+            }),
+            Step::Terminate => match (link, self.closed.as_deref()) {
+                (Some(_), _) => None,
+                (None, Some(why)) if why == link::TERMINATED => Some(Ok(why.into())),
+                (None, why) => Some(Err(format!("ended otherwise: {}", why.unwrap_or("?")))),
             },
         }
     }

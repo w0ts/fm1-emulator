@@ -48,6 +48,9 @@ pub enum Step {
     ChannelMap(u64),
     /// LL_TERMINATE_IND (remote user terminated).
     Terminate,
+    /// Stop transmitting without a terminate (link loss), then wait for the
+    /// peripheral to advertise again.
+    Vanish,
 }
 
 /// The script CoreBluetooth-like centrals follow, then a MIDI exchange,
@@ -143,6 +146,7 @@ fn parse_line(line: &str) -> Result<Step, String> {
             u64::from_str_radix(arg(1).ok_or("chmap needs a map")?, 16).map_err(|_| "bad map")?,
         ),
         "terminate" => Step::Terminate,
+        "vanish" => Step::Vanish,
         other => return Err(format!("unknown step {other}")),
     })
 }
