@@ -960,7 +960,9 @@ impl Bus {
         self.advance_devices(ticks);
         self.nor.advance(ticks);
         self.refresh_xip_view();
-        self.wireless.advance(ticks);
+        self.wireless
+            .advance(ticks, &mut self.ram)
+            .map_err(|reason| Self::fault(0x28000, 4, "BLE engine", reason))?;
         self.system
             .advance(ticks)
             .map_err(|reason| Self::fault(0x13e08, 4, "watchdog", reason))?;
@@ -1028,6 +1030,28 @@ impl Bus {
         self.advance_clocked(ticks)?;
         self.next_event = now + self.ticks_to_event();
         Ok(())
+    }
+
+    /// The BLE baseband engine model (state, statistics, air log).
+    pub fn ble_engine(&self) -> &crate::ble_engine::Engine {
+        &self.wireless.ble
+    }
+    /// The engine, for configuration; event times are recomputed.
+    pub fn ble_engine_mut(&mut self) -> &mut crate::ble_engine::Engine {
+        self.irq_quiet = false;
+        self.next_event = self.next_event.min(self.oscillator_ticks + 1);
+        &mut self.wireless.ble
+    }
+    /// Put a virtual central on the virtual air (replacing any other).
+    pub fn ble_attach_central(&mut self, central: crate::ble_central::Central) {
+        self.ble_engine_mut().attach_central(central);
+    }
+    pub fn ble_central(&self) -> Option<&crate::ble_central::Central> {
+        self.wireless.ble.central()
+    }
+    /// The central, to queue steps; event times are recomputed.
+    pub fn ble_central_mut(&mut self) -> Option<&mut crate::ble_central::Central> {
+        self.ble_engine_mut().central_mut()
     }
 
     /// Put MIDI bytes on the UART1 RX line (the FM-1's DIN/TRS MIDI IN):
@@ -1163,6 +1187,8 @@ impl Bus {
             || self.shift_spi.pending_irq()
             || self.wireless.clock_pending_irq()
             || self.wireless.slot_pending_irq()
+            || self.wireless.ble.event_irq()
+            || self.wireless.ble.rx_irq()
     }
 
     /// 24 MHz oscillator ticks of guest time so far.
@@ -1210,7 +1236,9 @@ impl Bus {
             | ((self.audio.pending_irq() as u128) << crate::audio::IRQ)
             | ((self.shift_spi.pending_irq() as u128) << crate::shift_spi::IRQ)
             | ((self.wireless.clock_pending_irq() as u128) << 40)
-            | ((self.wireless.slot_pending_irq() as u128) << 41);
+            | ((self.wireless.slot_pending_irq() as u128) << 41)
+            | ((self.wireless.ble.rx_irq() as u128) << crate::ble_engine::RX_IRQ)
+            | ((self.wireless.ble.event_irq() as u128) << crate::ble_engine::EVENT_IRQ);
         self.devices.select_irq(sources, icfg, core)
     }
 }
