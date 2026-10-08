@@ -47,6 +47,18 @@ pub enum ScanResponse {
     Software,
 }
 
+/// Q1: a received packet whose SN is the one already acknowledged (the
+/// central's retransmission) is acknowledged again in every mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OldSn {
+    /// Discarded silently: no buffer, no interrupt.
+    Drop,
+    /// Discarded, but the RX interrupt is raised (no buffer is filled).
+    DropWithIrq,
+    /// Stored and signalled like a new packet; the driver must drop it.
+    Store,
+}
+
 /// Choices where the fact sheet leaves the behaviour open.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -62,10 +74,11 @@ pub struct EngineConfig {
     /// bookkeeping, so new empty PDUs are stored like data [I]. False: an
     /// empty PDU is acknowledged without a buffer or an interrupt.
     pub store_empty_pdus: bool,
-    /// Q1: the engine discards a packet that repeats the last SN (it is
-    /// still acknowledged). False: it is stored and raises the RX
-    /// interrupt like a new one; the driver must drop it (RXDHDR SN).
-    pub drop_old_sn: bool,
+    /// Q1: what the engine does with a packet that repeats the last SN.
+    pub old_sn: OldSn,
+    /// Q1: a discarded repeat still updates EVTCOUNT (the event counter of
+    /// the last reception).
+    pub rx_count_repeats: bool,
     /// Q2: the event interrupt fires at the end of every connection event,
     /// received or not (needed by a software supervision timer, §7 step 15).
     /// False: only after events in which a packet was received.
@@ -92,7 +105,7 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// Apply `key=value` settings separated by commas, e.g.
-    /// `scan_rsp=software,drop_old_sn=0,pairs=4`.
+    /// `scan_rsp=software,old_sn=irq,pairs=4`.
     pub fn apply(&mut self, settings: &str) -> Result<(), String> {
         for item in settings.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (key, value) = item
@@ -115,13 +128,21 @@ impl EngineConfig {
                 "stop_adv" => self.stop_adv_on_connect_ind = flag()?,
                 "adv_irq_on_connect" => self.adv_event_irq_on_connect = flag()?,
                 "store_empty" => self.store_empty_pdus = flag()?,
-                "drop_old_sn" => self.drop_old_sn = flag()?,
+                "old_sn" => {
+                    self.old_sn = match value {
+                        "drop" => OldSn::Drop,
+                        "irq" => OldSn::DropWithIrq,
+                        "store" => OldSn::Store,
+                        _ => return Err("old_sn: drop, irq or store".into()),
+                    }
+                }
                 "event_irq_every_event" => self.event_irq_every_event = flag()?,
                 "engine_retransmits" => self.engine_retransmits = flag()?,
                 "pairs" => {
                     self.max_pairs_per_event = value.parse().map_err(|_| "pairs: a number")?
                 }
                 "instant_gating" => self.instant_gating = flag()?,
+                "rx_count_repeats" => self.rx_count_repeats = flag()?,
                 "rx_needs_armed" => self.rx_needs_armed = flag()?,
                 "seed" => self.seed = value.parse().map_err(|_| "seed: a number")?,
                 _ => return Err(format!("unknown engine setting {key}")),
@@ -142,7 +163,8 @@ impl Default for EngineConfig {
             stop_adv_on_connect_ind: true,
             adv_event_irq_on_connect: true,
             store_empty_pdus: true,
-            drop_old_sn: true,
+            old_sn: OldSn::Drop,
+            rx_count_repeats: true,
             event_irq_every_event: true,
             engine_retransmits: true,
             max_pairs_per_event: 1,

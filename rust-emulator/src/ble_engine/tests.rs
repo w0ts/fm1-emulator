@@ -340,8 +340,8 @@ fn unacknowledged_pdus_are_resent_and_old_sn_is_dropped() {
     assert_eq!(rig.engine.stats.rx_stored, stored);
     rig.engine.conn_tx(0, block, &mut w).unwrap();
     assert_eq!(rig.engine.stats.tx_retransmit, 1);
-    // drop_old_sn=0: the same packet is stored for the driver to drop.
-    rig.engine.config.apply("drop_old_sn=0").unwrap();
+    // old_sn=store: the same packet is stored for the driver to drop.
+    rig.engine.config.apply("old_sn=store").unwrap();
     conn = rig.engine.links[0].conn.clone().unwrap();
     conn.awaiting = true;
     rig.engine.links[0].conn = Some(conn);

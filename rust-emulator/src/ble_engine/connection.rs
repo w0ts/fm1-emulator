@@ -249,8 +249,16 @@ impl Engine {
         }
         let empty = h0 & 3 == 1 && tx.pdu[1] == 0;
         let repeated = peer_sn != conn.nesn;
-        let note = if repeated && self.config.drop_old_sn {
+        // EVTCOUNT is "the event counter of the last RX" (§3 [M:s]); with
+        // rx_count_repeats a discarded repeat still counts as a reception.
+        if repeated && self.config.rx_count_repeats {
+            block.set(w, field::EVTCOUNT, conn.counter)?;
+        }
+        let note = if repeated && self.config.old_sn == OldSn::Drop {
             "old SN: retransmission ignored"
+        } else if repeated && self.config.old_sn == OldSn::DropWithIrq {
+            self.irq_due.push((end, link, true));
+            "old SN: discarded, RX IRQ"
         } else if repeated {
             let stored = self.store_conn_rx(
                 link,
@@ -265,7 +273,7 @@ impl Engine {
                 },
             )?;
             if stored {
-                "old SN: stored anyway (drop_old_sn=0), RX IRQ"
+                "old SN: stored anyway (old_sn=store), RX IRQ"
             } else {
                 "old SN, no armed RX buffer"
             }
