@@ -546,6 +546,12 @@ and the code comments cite its sections. Sources: `src/ble_air.rs` (PDUs, CSA
   into the RX buffers, SN/NESN and the TX buffer toggle, empty PDUs, event
   (IRQ 45) and RX (IRQ 29) interrupts, connection-update and channel-map
   instants, supervision timeout.
+- Scanning (link state 1, fact sheet §21.2): windows every interval on the
+  channel column 6 held when the window opened, the event interrupt at each
+  window's end, reports stored the connection-path way (RXTOG buffer,
+  RXBUFnCNTL bit0, RSSI2, LASTCHMAP) with the RX interrupt, and the engine's
+  own SCAN_REQ (AdvA filled in) answered by **virtual advertisers**
+  (`FM1_BLE_ADVERTISERS`, `src/ble_engine/scanning.rs`).
 - The central side: scanning, CONNECT_IND, the master clock and hop schedule,
   LL procedures (version, features, connection update, channel map,
   terminate), and an L2CAP/ATT client that does MTU exchange, GATT discovery
@@ -575,6 +581,8 @@ brackets.
 | `instant_gating` | flag [1] | Interval/offset changes (columns 1/15/4) take effect only at the column-5 instant |
 | `rx_needs_armed` | flag [0] | Store only into an RX buffer whose RXBUFnCNTL bit0 is 0; stock V15 never receives with it on |
 | `seed` | number | Seed of the advDelay generator |
+| `scan_cntl` | flag [1] | §21.9 C2: while scanning, set RXBUFnCNTL bit0 on the filled buffer (0: leave it 0, RXTOG alone moves) |
+| `scan_adva` | flag [1] | §21.9 C1: the engine writes the advertiser's AdvA into the SCAN_REQ (0: the zeros go out, nobody answers) |
 
 ### The virtual central and its variables
 
@@ -591,6 +599,7 @@ Used by `examples/diagnose` (and by `Bus::ble_attach_central` in tests).
 | `FM1_BLE_WINDOW_DELAY_US=N` | Where in the transmit window the first packet goes |
 | `FM1_BLE_LOG=PATH` | Write every packet on the virtual air to PATH (otherwise the first 40 are printed) |
 | `FM1_BLE_ISR=1` | Report interrupt-handler timing on CPU 0 (handler length in instructions and guest time, delay of IRQ 29/45 entry, share spent in the audio handler IRQ 11). Nesting is off by default, so it cannot say whether 29/45 could preempt audio |
+| `FM1_BLE_ADVERTISERS=default\|SPEC` | Virtual advertisers for a scanning firmware to hear: `default` = KeyStep 37 (BLE-MIDI, name in the scan response), WIDI (name in the ADV_IND), FM-1 B00B, iPad AUM (a resolvable private address), Tile (a beacon), NonConn MIDI (not connectable); or `midi:NAME[:adv][:ms=N][:rssi=W];beacon:NAME;...`. Works without a central (`FM1_BLE_CENTRAL` unset); the air log marks their packets `A->S` |
 | `FM1_PRESS=STEP:COLUMN:ROW:LENGTH[,...]` | Hold a panel matrix contact from instruction STEP for LENGTH instructions (a key press, to see notifications) |
 
 A script is one step per line, `#` starts a comment, options are `key=value`
