@@ -536,7 +536,8 @@ engine behaviour is a hypothesis built from the fact sheet
 (`docs/BLE-HW-FACTS.md` in the optimist repository, branch `feat/ble-facts`),
 and the code comments cite its sections. Sources: `src/ble_air.rs` (PDUs, CSA
 #1), `src/ble_param.rs` (control block and DMA window), `src/ble_engine/`,
-`src/ble_central/`, `src/isr_profile.rs`.
+`src/ble_central/`, `src/ble_peripheral/`, `src/ble_crypto.rs`,
+`src/isr_profile.rs`.
 
 ### What is modelled
 
@@ -557,8 +558,28 @@ and the code comments cite its sections. Sources: `src/ble_air.rs` (PDUs, CSA
   terminate), and an L2CAP/ATT client that does MTU exchange, GATT discovery
   the way CoreBluetooth does, the BLE-MIDI read, CCCD subscribe, writes
   without response and notifications.
+- The FM-1 as **central** (fact sheet §21.3, §21.4; `src/ble_engine/central.rs`):
+  initiating (link state 3: windows as scanning, the target's ADV_IND answered
+  T_IFS later by the engine with the CONNECT_IND software left in the TXTOG
+  buffer, then the event interrupt at its end), the master connection (state 6:
+  the first anchor from the anchor counter software starts, the engine
+  transmitting first at each anchor from the TXTOG buffer, the reply stored in
+  the RXTOG buffer, TXBUFnCNTL bit0 back to 1 and TXTOG moved on the
+  acknowledgement, the event interrupt per event, instants with column 4 as
+  the master's 2 x WinOffset).
+- **Virtual BLE-MIDI peripherals** (`FM1_BLE_PERIPHERALS`, `src/ble_peripheral/`)
+  for that central: they advertise the BLE-MIDI service, answer the engine's
+  SCAN_REQ, take a CONNECT_IND and run the slave side with their own clock
+  (transmit window, CSA #1, SN / NESN, instants, supervision), an ATT server
+  whose BLE-MIDI service is the fourth (GAP, GATT, Battery first), an SMP
+  responder (LE legacy Just Works with bonding, keys derived from a seed so a
+  second run finds the same bond), LL encryption (AES-CCM), notes as
+  notifications once subscribed, and a record of the MIDI the FM-1 writes.
+  `src/ble_crypto.rs` has AES-128, AES-CCM, c1, s1 and ah, tested on the
+  FIPS-197 and Core sample data.
 - Not modelled: the chip's hardware AES block at `0x41200` (see the stub
-  below), encryption, data length extension, radio timing below a microsecond.
+  below), encryption on the FM-1's own peripheral side of the model (the
+  virtual central does not pair), radio timing below a microsecond.
 
 ### Hypotheses switchable through `FM1_BLE_MODEL`
 
@@ -583,6 +604,10 @@ brackets.
 | `seed` | number | Seed of the advDelay generator |
 | `scan_cntl` | flag [1] | §21.9 C2: while scanning, set RXBUFnCNTL bit0 on the filled buffer (0: leave it 0, RXTOG alone moves) |
 | `scan_adva` | flag [1] | §21.9 C1: the engine writes the advertiser's AdvA into the SCAN_REQ (0: the zeros go out, nobody answers) |
+| `init_cind` | flag [1] | §21.9 C3: while initiating, the engine answers the target's ADV_IND (WHITELIST0, FILTERCNTL bits 0 / 4 / 8; or an ADV_DIRECT_IND to LOCALADR) with the CONNECT_IND in the TXTOG buffer (0: nothing is sent) |
+| `init_evt_after_cind` | flag [1] | §21.9 C4: with column 9 bit0 set, initiating stops after the CONNECT_IND and the event interrupt comes at its end (0: at the end of that window) |
+| `master_anchor_from_counter` | flag [1] | §21.9 C5: the master's first anchor is column 0 + 1 slots after software started the anchor counter (column 14) (0: the transmit window's start) |
+| `master_tx_first` | flag [1] | §21.9 C6: the master transmits first at each anchor (0: it sends nothing, so nothing is heard) |
 
 ### The virtual central and its variables
 
@@ -600,7 +625,24 @@ Used by `examples/diagnose` (and by `Bus::ble_attach_central` in tests).
 | `FM1_BLE_LOG=PATH` | Write every packet on the virtual air to PATH (otherwise the first 40 are printed) |
 | `FM1_BLE_ISR=1` | Report interrupt-handler timing on CPU 0 (handler length in instructions and guest time, delay of IRQ 29/45 entry, share spent in the audio handler IRQ 11). Nesting is off by default, so it cannot say whether 29/45 could preempt audio |
 | `FM1_BLE_ADVERTISERS=default\|SPEC` | Virtual advertisers for a scanning firmware to hear: `default` = KeyStep 37 (BLE-MIDI, name in the scan response), WIDI (name in the ADV_IND), FM-1 B00B, iPad AUM (a resolvable private address), Tile (a beacon), NonConn MIDI (not connectable); or `midi:NAME[:adv][:ms=N][:rssi=W];beacon:NAME;...`. Works without a central (`FM1_BLE_CENTRAL` unset); the air log marks their packets `A->S` |
+| `FM1_BLE_PERIPHERALS=SPEC` | Connectable virtual BLE-MIDI peripherals for the FM-1 as central, `;`-separated `midi:NAME[:pair][:secreq][:rpa][:upd][:nonotes][:appear=MS][:vanish=MS][:seed=N][:boot=N][:ms=N]`: `pair` answers Insufficient Authentication on the MIDI value and its CCCD until the link is encrypted (Apple, QA1831); `secreq` sends an SMP Security Request at each connection; `rpa` advertises from a resolvable private address of its IRK and distributes IRK + identity (Mac-like); `upd` sends an L2CAP Connection Parameter Update Request {12, 12, 0, 200} once subscribed; `nonotes` sends no notes (default: a note on / off every 200 ms once subscribed); `appear` / `vanish` in guest ms; `seed` derives its keys and addresses (default from the name); `boot` gives a new RPA with the same keys; `ms` the advertising interval (30). Each prints a `ble_peripheral name=...` line at the end of the run |
+| `FM1_BLE_PERIPHERAL_BOOT=N` | The boot number of every peripheral (a second run as "after a reboot of the phone": new RPA, same bond) |
 | `FM1_PRESS=STEP:COLUMN:ROW:LENGTH[,...]` | Hold a panel matrix contact from instruction STEP for LENGTH instructions (a key press, to see notifications) |
+
+The end-of-run report of `diagnose` has one line for the central role's engine
+counters and one line per virtual peripheral, `key=value` separated by spaces
+(names with `_` for spaces; lists comma-separated; `-` for none):
+
+```
+ble_engine_central init_windows=N connect_inds_sent=N master_events=N master_tx_data=N master_tx_empty=N master_tx_retransmit=N master_rx=N
+ble_peripheral name=NAME addr=HEX identity=HEX adv=N scan_reqs=N conns=N established=N in_window=yes|no|- offset_us=N first_event=N events=N ll=LL_VERSION_IND,... mtu=N auth_errors=N paired=0|1 ltk_reuse=N encrypted=0|1 subscribed=0|1 ntf=N writes=N midi=903c64,803c00|- updates=N chmaps=N param_result=N|- peer_identity=HEX|- ended=REASON|...|-
+```
+
+`addr` / `identity` are written most significant octet first; `in_window` /
+`offset_us` / `first_event` describe the first master packet of the first
+connection (its distance from the transmit window's start); `ltk_reuse` counts
+encryptions started with the bond's EDIV / Rand; `midi` lists the first 16
+messages the FM-1 wrote (hex, status first).
 
 A script is one step per line, `#` starts a comment, options are `key=value`
 (`interval`, `latency`, `timeout`, `winsize`, `winoffset`, `hop`, `chmap` in

@@ -555,7 +555,11 @@ fn run() -> Result<(), String> {
 /// `scan` only scans. FM1_BLE_MODEL=key=value,... sets engine hypotheses
 /// (ble_engine::EngineConfig::apply). FM1_BLE_ADVERTISERS=default|SPEC puts
 /// virtual advertisers on the air for a scanning FM-1 to hear
-/// (ble_engine::Advertiser::parse). Returns whether BLE reporting is on.
+/// (ble_engine::Advertiser::parse). FM1_BLE_PERIPHERALS=SPEC puts
+/// connectable virtual BLE-MIDI peripherals on the air for the FM-1 as
+/// central (ble_peripheral::PeripheralConfig::parse); FM1_BLE_PERIPHERAL_BOOT=N
+/// sets their boot number (a new RPA per boot, the same keys). Returns
+/// whether BLE reporting is on.
 fn setup_ble(cpu: &mut Cpu) -> Result<bool, String> {
     use fm1_emu::ble_central::{script, Central, CentralConfig, Step};
     if let Ok(settings) = env::var("FM1_BLE_MODEL") {
@@ -565,8 +569,26 @@ fn setup_ble(cpu: &mut Cpu) -> Result<bool, String> {
     if let Some(spec) = &advertisers {
         cpu.bus.ble_engine_mut().advertisers = fm1_emu::ble_engine::Advertiser::parse(spec)?;
     }
+    let peripherals = env::var("FM1_BLE_PERIPHERALS").ok();
+    if let Some(spec) = &peripherals {
+        use fm1_emu::ble_peripheral::{Peripheral, PeripheralConfig};
+        let mut configs = PeripheralConfig::parse(spec)?;
+        if let Ok(boot) = env::var("FM1_BLE_PERIPHERAL_BOOT") {
+            let boot = boot
+                .parse()
+                .map_err(|_| "invalid FM1_BLE_PERIPHERAL_BOOT")?;
+            for c in &mut configs {
+                c.boot = boot;
+            }
+        }
+        cpu.bus.ble_engine_mut().peripherals = configs.into_iter().map(Peripheral::new).collect();
+    }
     let steps = match env::var("FM1_BLE_CENTRAL").as_deref() {
-        Err(_) | Ok("off") => return Ok(env::var("FM1_BLE_MODEL").is_ok() || advertisers.is_some()),
+        Err(_) | Ok("off") => {
+            return Ok(env::var("FM1_BLE_MODEL").is_ok()
+                || advertisers.is_some()
+                || peripherals.is_some())
+        }
         Ok("scan") => vec![Step::Scan(u32::MAX)],
         Ok("script") => match env::var("FM1_BLE_SCRIPT") {
             Ok(path) => {
@@ -607,6 +629,21 @@ fn report_ble(cpu: &Cpu) -> Result<(), String> {
             "  advertiser {:<14} {:02x?} sent {} scan_req {} scan_rsp {}",
             a.name, a.address, a.sent, a.scan_reqs, a.scan_rsps
         );
+    }
+    let s = &engine.stats;
+    eprintln!(
+        "ble_engine_central init_windows={} connect_inds_sent={} master_events={} master_tx_data={} \
+         master_tx_empty={} master_tx_retransmit={} master_rx={}",
+        s.init_windows,
+        s.connect_inds_sent,
+        s.master_events,
+        s.master_tx_data,
+        s.master_tx_empty,
+        s.master_tx_retransmit,
+        s.master_rx
+    );
+    for p in &engine.peripherals {
+        eprintln!("{}", p.report_line());
     }
     for note in engine.notes() {
         eprintln!("  model: {note}");
