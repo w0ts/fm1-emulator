@@ -419,3 +419,166 @@ fn an_unknown_ediv_is_rejected_and_the_options_parse() {
     assert!(PeripheralConfig::parse("midi:A:bogus").is_err());
     assert_eq!(Keys::derive(7), Keys::derive(7));
 }
+
+/// A legacy pairing as the FM-1 runs it with `preq`: Mconfirm, (its user
+/// typing `shown` when it waits for a passkey), Sconfirm / Srand checked
+/// with TK = `tk`, the STK, the responder's keys, ours -> its LTK, EDIV,
+/// Rand; None when it failed (its Pairing Failed reason in `failed`).
+fn legacy_pair(
+    m: &mut Master,
+    preq: [u8; 7],
+    tk: u32,
+    shown: Option<u32>,
+    failed: &mut u8,
+) -> Option<([u8; 16], u16, [u8; 8])> {
+    m.l2cap(6, &preq);
+    let pres = m.frame(6);
+    let ctx = PairingContext {
+        preq,
+        pres: pres.clone().try_into().unwrap(),
+        iat: 1,
+        ia: OWN,
+        rat: 1,
+        ra: m.p.address,
+    };
+    let mut k = [0u8; 16];
+    k[..4].copy_from_slice(&tk.to_le_bytes());
+    let mrand = [9u8; 16];
+    let mut c = vec![0x03];
+    c.extend(c1(&k, &mrand, &ctx));
+    m.l2cap(6, &c);
+    if let Some(v) = shown {
+        m.events(30);
+        assert!(m.p.wants_passkey(), "it waits for its user");
+        assert!(
+            m.frames.iter().all(|f| f.0 != 6),
+            "no Sconfirm before the passkey is typed"
+        );
+        m.p.type_passkey(v);
+    }
+    let sconf = m.frame(6);
+    let mut r = vec![0x04];
+    r.extend(mrand);
+    m.l2cap(6, &r);
+    let srand = m.frame(6);
+    if srand[0] == 0x05 {
+        *failed = srand[1];
+        return None;
+    }
+    let srand: [u8; 16] = srand[1..17].try_into().unwrap();
+    assert_eq!(
+        &sconf[1..17],
+        &c1(&k, &srand, &ctx),
+        "Sconfirm with the TK typed"
+    );
+    m.encrypt(&s1(&k, &srand, &mrand), 0, &[0; 8]);
+    let enc = m.frame(6);
+    let ident = m.frame(6);
+    for (op, len) in [(0x06u8, 17usize), (0x07, 11), (0x08, 17)] {
+        let mut x = vec![op];
+        x.resize(len, 0x42);
+        m.l2cap(6, &x);
+    }
+    let mut a = vec![0x09, 1];
+    a.extend(OWN);
+    m.l2cap(6, &a);
+    m.events(6);
+    Some((
+        enc[1..17].try_into().unwrap(),
+        u16::from_le_bytes([ident[1], ident[2]]),
+        ident[3..11].try_into().unwrap(),
+    ))
+}
+
+fn cccd_write(m: &mut Master) -> Vec<u8> {
+    let mut w = vec![0x12];
+    w.extend(H_MIDI_CCC.to_le_bytes());
+    w.extend([1, 0]);
+    m.att(&w)
+}
+
+/// iPhone-like (`auth`): a Just Works pairing runs, then its Pairing
+/// Failed (Unspecified Reason) and Insufficient Authentication again; a
+/// passkey pairing (DisplayOnly + MITM, its user typing what the FM-1
+/// shows) authenticates; that bond's LTK later is authenticated, the Just
+/// Works one is not; a passkey typed wrong fails the confirm.
+#[test]
+fn an_auth_peripheral_needs_the_passkey() {
+    let mut cfg = PeripheralConfig::new("iPhone Piano");
+    cfg.auth = true;
+    cfg.pair = true;
+    let mut m = Master::connect(cfg.clone(), 150);
+    let mut failed = 0;
+    assert_eq!(cccd_write(&mut m)[4], 0x05);
+    let jw = [0x01, 0x03, 0x00, 0x01, 16, 0x03, 0x03];
+    m.l2cap(6, &jw);
+    let pres = m.frame(6);
+    assert_eq!(
+        pres,
+        [0x02, 0x04, 0x00, 0x01, 16, 0x03, 0x01],
+        "KeyboardDisplay, no MITM mirrored"
+    );
+    let mut m = Master::connect(cfg.clone(), 150);
+    let jw_keys = legacy_pair(&mut m, jw, 0, None, &mut failed).expect("Just Works runs");
+    assert_eq!(
+        m.frame(6),
+        [0x05, 0x08],
+        "its Pairing Failed after the keys"
+    );
+    assert_eq!(m.p.report.late_fails, 1);
+    assert!(!m.p.report.authenticated);
+    assert_eq!(
+        cccd_write(&mut m)[4],
+        0x05,
+        "still Insufficient Authentication"
+    );
+    // Again with MITM, the FM-1 displaying: passkey entry, its user types.
+    let mut m = Master::connect(cfg.clone(), 150);
+    let mitm = [0x01, 0x00, 0x00, 0x05, 16, 0x03, 0x03];
+    let pk = 284_517;
+    let bond = legacy_pair(&mut m, mitm, pk, Some(pk), &mut failed).expect("passkey entry");
+    assert_eq!(m.p.report.passkey, Some(pk));
+    assert_eq!((m.p.report.auth_pairings, m.p.report.passkey_waits), (1, 1));
+    assert!(m.p.report.authenticated);
+    assert!(
+        m.frames.iter().all(|f| f.0 != 6),
+        "no Pairing Failed this time"
+    );
+    assert_eq!(cccd_write(&mut m), [0x13]);
+    m.events(20);
+    assert!(m.p.report.notifications > 0);
+    // Reconnections: the passkey bond is authenticated, the Just Works one not.
+    let mut m = Master::connect(cfg.clone(), 100);
+    m.encrypt(&bond.0, bond.1, &bond.2);
+    assert!(m.p.report.authenticated && m.p.report.ltk_reuse == 1);
+    assert_eq!(cccd_write(&mut m), [0x13]);
+    let mut m = Master::connect(cfg.clone(), 100);
+    m.encrypt(&jw_keys.0, jw_keys.1, &jw_keys.2);
+    assert!(m.p.report.encrypted && !m.p.report.authenticated);
+    assert_eq!(cccd_write(&mut m)[4], 0x05);
+    // Its user types it wrong: Confirm Value Failed (the FM-1's check).
+    cfg.typo = true;
+    let mut m = Master::connect(cfg, 150);
+    m.l2cap(6, &mitm);
+    let pres = m.frame(6);
+    assert_eq!(pres[..4], [0x02, 0x04, 0x00, 0x05]);
+    let mut c = vec![0x03];
+    c.extend([0u8; 16]);
+    m.l2cap(6, &c);
+    m.events(10);
+    m.p.type_passkey(pk);
+    assert_eq!(m.p.report.passkey, Some(pk + 1));
+    assert!(legacy_pair_tail_fails(&mut m));
+    let v = PeripheralConfig::parse("midi:P:auth:typo").unwrap();
+    assert!(v[0].auth && v[0].pair && v[0].typo);
+}
+
+/// After a wrong passkey: its Sconfirm (made with the wrong TK) does not
+/// match what the FM-1 expects; the FM-1's Pairing Failed ends it.
+fn legacy_pair_tail_fails(m: &mut Master) -> bool {
+    let sconf = m.frame(6);
+    assert_eq!(sconf[0], 0x03);
+    m.l2cap(6, &[0x05, 0x04]);
+    m.events(4);
+    !m.p.wants_passkey() && !m.p.report.authenticated
+}

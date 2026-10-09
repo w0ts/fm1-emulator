@@ -2,8 +2,9 @@
 //! The peripheral's host: L2CAP basic frames, the LE signalling channel,
 //! an ATT server over a controller-shaped GATT database (the BLE-MIDI
 //! service is not the first), the SMP responder (LE legacy pairing, Just
-//! Works, bonding) and the BLE-MIDI data path (Core Vol 3 Parts A, F, G, H;
-//! the BLE-MIDI specification).
+//! Works or, for an auth peripheral, passkey entry with its user typing;
+//! bonding) and the BLE-MIDI data path (Core Vol 3 Parts A, F, G, H; the
+//! BLE-MIDI specification).
 
 use super::*;
 use crate::ble_crypto::{c1, s1, PairingContext};
@@ -34,6 +35,9 @@ enum SmpState {
     #[default]
     Idle,
     Confirm,
+    /// Passkey entry: Mconfirm taken, waiting for its user to type the
+    /// passkey the initiator shows (`Peripheral::type_passkey`).
+    Passkey,
     Random,
     Encrypt,
     Keys,
@@ -49,6 +53,10 @@ struct Smp {
     stk: Option<[u8; 16]>,
     ours: u8,
     expect: u8,
+    /// The TK: 0 (Just Works) or the passkey typed (passkey entry).
+    tk: [u8; 16],
+    /// The method is passkey entry (the keys will be authenticated).
+    passkey: bool,
 }
 
 #[derive(Default)]
@@ -63,6 +71,9 @@ pub(super) struct Host {
     note_on: bool,
     sig_id: u8,
     upd_sent: bool,
+    /// The link's key is authenticated (now; and the one being started).
+    link_auth: bool,
+    pending_auth: bool,
 }
 
 struct Attr {
@@ -195,8 +206,11 @@ impl Peripheral {
         self.link.as_ref().is_some_and(|l| l.encrypted())
     }
 
+    /// The MIDI value and its CCCD: encrypted (pair), with an authenticated
+    /// key (auth); else Insufficient Authentication.
     fn needs_encryption(&self, h: u16) -> bool {
-        self.config.pair && (h == H_MIDI_IO || h == H_MIDI_CCC) && !self.encrypted()
+        let secure = self.encrypted() && (!self.config.auth || self.host.link_auth);
+        self.config.pair && (h == H_MIDI_IO || h == H_MIDI_CCC) && !secure
     }
 
     fn send(&mut self, cid: u16, payload: &[u8]) {
@@ -239,7 +253,7 @@ impl Peripheral {
                 self.send(CID_SMP, &[0x0B, 0x01]);
             }
         }
-        let ready = self.host.cccd[2] & 1 != 0 && (self.encrypted() || !self.config.pair);
+        let ready = self.host.cccd[2] & 1 != 0 && !self.needs_encryption(H_MIDI_IO);
         if !ready || !self.config.notes || now < self.host.notes_next {
             return;
         }
@@ -495,7 +509,6 @@ impl Peripheral {
         if (op as usize) < lens.len() && p.len() != lens[op as usize] {
             return self.smp_fail(0x0A);
         }
-        let k0 = [0u8; 16];
         match op {
             0x01 => {
                 if p[4] < 7 {
@@ -505,7 +518,18 @@ impl Peripheral {
                     return;
                 };
                 let ours = p[6] & (1 | if self.config.rpa { 2 } else { 0 });
-                let pres = [0x02, 0x03, 0x00, 0x01, 16, p[5] & 3, ours];
+                // An auth peripheral is KeyboardDisplay and mirrors the MITM
+                // flag; passkey entry with its user typing when MITM is asked
+                // and the initiator can display (DisplayOnly / DisplayYesNo:
+                // Core Vol 3 Part H 2.3.5.1, Table 2.8), else Just Works.
+                let auth = self.config.auth;
+                let (io, auth_req) = if auth {
+                    (0x04, 0x01 | (p[3] & 0x04))
+                } else {
+                    (0x03, 0x01)
+                };
+                let passkey = auth && p[3] & 0x04 != 0 && matches!(p[1], 0x00 | 0x01);
+                let pres = [0x02, io, 0x00, auth_req, 16, p[5] & 3, ours];
                 let mut ctx = PairingContext {
                     pres,
                     iat: link.peer_random as u8,
@@ -521,27 +545,29 @@ impl Peripheral {
                     key_size: p[4].min(16),
                     ours,
                     expect: p[5] & 3,
+                    passkey,
                     ..Default::default()
                 };
                 self.send(CID_SMP, &pres);
             }
             0x03 if self.host.smp.state == SmpState::Confirm => {
                 self.host.smp.mconfirm.copy_from_slice(&p[1..17]);
-                let srand = self.random16();
-                self.host.smp.srand = srand;
-                let mut r = vec![0x03];
-                r.extend(c1(&k0, &srand, &self.host.smp.ctx));
-                self.host.smp.state = SmpState::Random;
-                self.send(CID_SMP, &r);
+                if self.host.smp.passkey {
+                    self.host.smp.state = SmpState::Passkey;
+                    self.report.passkey_waits += 1;
+                    return;
+                }
+                self.smp_sconfirm();
             }
             0x04 if self.host.smp.state == SmpState::Random => {
                 let mut mrand = [0u8; 16];
                 mrand.copy_from_slice(&p[1..17]);
-                if c1(&k0, &mrand, &self.host.smp.ctx) != self.host.smp.mconfirm {
+                let tk = self.host.smp.tk;
+                if c1(&tk, &mrand, &self.host.smp.ctx) != self.host.smp.mconfirm {
                     return self.smp_fail(0x04);
                 }
                 let srand = self.host.smp.srand;
-                let mut stk = s1(&k0, &srand, &mrand);
+                let mut stk = s1(&tk, &srand, &mrand);
                 for b in stk.iter_mut().skip(self.host.smp.key_size as usize) {
                     *b = 0;
                 }
@@ -564,12 +590,69 @@ impl Peripheral {
                     _ => {}
                 }
                 if self.host.smp.expect == 0 {
-                    self.host.smp.state = SmpState::Idle;
-                    self.report.paired = true;
+                    self.smp_done();
                 }
             }
             _ if op <= 0x0B => {}
             _ => self.smp_fail(0x07),
+        }
+    }
+
+    /// Sconfirm = c1(TK, Srand, ...) to the initiator (Core Vol 3 Part H
+    /// 2.3.5.5).
+    fn smp_sconfirm(&mut self) {
+        let srand = self.random16();
+        self.host.smp.srand = srand;
+        let mut r = vec![0x03];
+        r.extend(c1(&self.host.smp.tk, &srand, &self.host.smp.ctx));
+        self.host.smp.state = SmpState::Random;
+        self.send(CID_SMP, &r);
+    }
+
+    /// A passkey pairing waits for its user.
+    pub fn wants_passkey(&self) -> bool {
+        self.link.is_some() && self.host.smp.state == SmpState::Passkey
+    }
+
+    /// Its user types the passkey the initiator shows (0..999999; with
+    /// `typo`, one more): TK = the passkey (2.3.5.3), Sconfirm goes.
+    pub fn type_passkey(&mut self, shown: u32) {
+        if !self.wants_passkey() {
+            return;
+        }
+        let typed = if self.config.typo {
+            (shown + 1) % 1_000_000
+        } else {
+            shown % 1_000_000
+        };
+        self.report.passkey = Some(typed);
+        self.host.smp.tk = [0; 16];
+        self.host.smp.tk[..4].copy_from_slice(&typed.to_le_bytes());
+        self.smp_sconfirm();
+    }
+
+    /// Both key sets went: bonded. An auth peripheral refuses a Just Works
+    /// bond afterwards with a Pairing Failed (Unspecified Reason), as the
+    /// iPhone did on the FM-1 (the bond not taken, Insufficient
+    /// Authentication on).
+    fn smp_done(&mut self) {
+        self.host.smp.state = SmpState::Idle;
+        self.report.paired = true;
+        if self.host.smp.passkey {
+            self.report.auth_pairings += 1;
+        } else if self.config.auth {
+            self.report.late_fails += 1;
+            self.send(CID_SMP, &[0x05, 0x08]);
+        }
+    }
+
+    /// The keys it distributes in this pairing: its bond, or for an auth
+    /// peripheral's Just Works pairing an unauthenticated one.
+    fn distributed(&self) -> Keys {
+        if self.config.auth && !self.host.smp.passkey {
+            self.keys.unauthenticated()
+        } else {
+            self.keys.clone()
         }
     }
 
@@ -579,37 +662,53 @@ impl Peripheral {
         if ediv == 0 && *rand == [0; 8] {
             return self.host.smp.stk.map(|k| (k, false));
         }
-        (ediv == self.keys.ediv && *rand == self.keys.rand).then_some((self.keys.ltk, true))
+        if ediv == self.keys.ediv && *rand == self.keys.rand {
+            return Some((self.keys.ltk, true));
+        }
+        let jw = self.keys.unauthenticated();
+        (self.config.auth && ediv == jw.ediv && *rand == jw.rand).then_some((jw.ltk, true))
+    }
+
+    /// An LL_ENC_REQ: whether the key it asks for is authenticated (the STK
+    /// of a passkey pairing, an auth peripheral's passkey bond).
+    pub(super) fn enc_request(&mut self, rand: &[u8; 8], ediv: u16) {
+        self.host.pending_auth = if ediv == 0 && *rand == [0; 8] {
+            self.host.smp.passkey
+        } else {
+            self.config.auth && ediv == self.keys.ediv && *rand == self.keys.rand
+        };
     }
 
     /// The link is encrypted both ways: a pairing's key distribution
     /// (the responder's keys first, Core Vol 3 Part H 3.6.1).
     pub(super) fn on_encrypted(&mut self) {
+        self.host.link_auth = self.host.pending_auth;
+        self.report.authenticated = self.host.link_auth;
         if self.host.smp.state != SmpState::Encrypt {
             return;
         }
         self.host.smp.state = SmpState::Keys;
         let ours = self.host.smp.ours;
+        let k = self.distributed();
         if ours & 1 != 0 {
             let mut e = vec![0x06];
-            e.extend(self.keys.ltk);
+            e.extend(k.ltk);
             self.send(CID_SMP, &e);
             let mut m = vec![0x07];
-            m.extend(u16le(self.keys.ediv));
-            m.extend(self.keys.rand);
+            m.extend(u16le(k.ediv));
+            m.extend(k.rand);
             self.send(CID_SMP, &m);
         }
         if ours & 2 != 0 {
             let mut i = vec![0x08];
-            i.extend(self.keys.irk);
+            i.extend(k.irk);
             self.send(CID_SMP, &i);
             let mut a = vec![0x09, 1];
-            a.extend(self.keys.identity);
+            a.extend(k.identity);
             self.send(CID_SMP, &a);
         }
         if self.host.smp.expect == 0 {
-            self.host.smp.state = SmpState::Idle;
-            self.report.paired = true;
+            self.smp_done();
         }
     }
 }

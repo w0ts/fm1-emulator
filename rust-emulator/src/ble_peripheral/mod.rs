@@ -6,7 +6,8 @@
 //! its address and runs the slave side of the connection with its own clock
 //! (transmit window, CSA #1, SN / NESN, instants, supervision), an L2CAP /
 //! ATT server with a controller-shaped database, an SMP responder (LE legacy
-//! Just Works with bonding), LL encryption, BLE-MIDI notifications and a
+//! Just Works with bonding; passkey entry for an iPhone-like `auth` one), LL
+//! encryption, BLE-MIDI notifications and a
 //! record of the MIDI the FM-1 writes to it.
 //!
 //! Built from the Bluetooth Core specification (Vol 3, Vol 6) and the MIDI
@@ -32,6 +33,16 @@ pub struct PeripheralConfig {
     /// Apple-like (QA1831): the MIDI value and its CCCD answer Insufficient
     /// Authentication until the link is encrypted.
     pub pair: bool,
+    /// iPhone-like (an iOS app's BLE-MIDI peripheral, as an FM-1 measured
+    /// it): its MIDI value and CCCD need an *authenticated* link (MITM).
+    /// It answers a pairing as KeyboardDisplay; a Just Works one runs to
+    /// the end, then it sends Pairing Failed (Unspecified Reason) and keeps
+    /// answering Insufficient Authentication; passkey entry (the initiator
+    /// displays, its user types: `type_passkey`) authenticates. Implies
+    /// `pair`.
+    pub auth: bool,
+    /// Its user types the passkey wrong (one more, modulo 1,000,000).
+    pub typo: bool,
     /// An SMP Security Request (bonding) at the start of every connection.
     pub secreq: bool,
     /// Mac-like: advertise from a resolvable private address made from the
@@ -57,6 +68,8 @@ impl PeripheralConfig {
         Self {
             name: name.into(),
             pair: false,
+            auth: false,
+            typo: false,
             secreq: false,
             rpa: false,
             upd: false,
@@ -71,7 +84,7 @@ impl PeripheralConfig {
         }
     }
 
-    /// `;`-separated `midi:NAME[:pair][:secreq][:rpa][:upd][:nonotes]
+    /// `;`-separated `midi:NAME[:pair][:auth][:typo][:secreq][:rpa][:upd][:nonotes]
     /// [:appear=MS][:vanish=MS][:seed=N][:boot=N][:ms=N]`.
     pub fn parse(spec: &str) -> Result<Vec<Self>, String> {
         let mut out = Vec::new();
@@ -89,6 +102,11 @@ impl PeripheralConfig {
                 match opt.split_once('=') {
                     None => match opt {
                         "pair" => c.pair = true,
+                        "auth" => {
+                            c.auth = true;
+                            c.pair = true;
+                        }
+                        "typo" => c.typo = true,
                         "secreq" => c.secreq = true,
                         "rpa" => c.rpa = true,
                         "upd" => c.upd = true,
@@ -155,6 +173,17 @@ impl Keys {
         k.identity[5] |= 0xC0;
         k
     }
+
+    /// The keys an auth peripheral hands out after a Just Works pairing
+    /// (an unauthenticated bond: told apart from the passkey bond by its
+    /// EDIV / Rand when the FM-1 encrypts with it later).
+    fn unauthenticated(&self) -> Self {
+        let mut k = self.clone();
+        k.ltk.iter_mut().for_each(|b| *b ^= 0x5A);
+        k.ediv ^= 0x5A5A;
+        k.rand.iter_mut().for_each(|b| *b ^= 0x5A);
+        k
+    }
 }
 
 /// What a peripheral saw, for diagnose's report and the tests.
@@ -176,6 +205,16 @@ pub struct Report {
     pub mtu: u16,
     pub auth_errors: u32,
     pub paired: bool,
+    /// Pairings that ended with its keys and the initiator's: passkey
+    /// entry (authenticated) and, for an auth peripheral, Just Works ones
+    /// it then refused with a Pairing Failed after the key distribution.
+    pub auth_pairings: u32,
+    pub late_fails: u32,
+    /// Passkey pairings that waited for its user; the passkey typed last.
+    pub passkey_waits: u32,
+    pub passkey: Option<u32>,
+    /// The link is encrypted with an authenticated key now.
+    pub authenticated: bool,
     /// Encryptions started with the bond's LTK (EDIV / Rand), not an STK.
     pub ltk_reuse: u32,
     pub encrypted: bool,
@@ -367,7 +406,8 @@ impl Peripheral {
         format!(
             "ble_peripheral name={} addr={} identity={} adv={} scan_reqs={} conns={} established={} \
              in_window={window} offset_us={} first_event={} events={} ll={} mtu={} auth_errors={} \
-             paired={} ltk_reuse={} encrypted={} subscribed={} ntf={} writes={} midi={} updates={} \
+             paired={} auth_pairings={} late_fails={} passkey_waits={} passkey={} authenticated={} \
+             ltk_reuse={} encrypted={} subscribed={} ntf={} writes={} midi={} updates={} \
              chmaps={} param_result={} peer_identity={} ended={}",
             self.config.name.replace(' ', "_"),
             hex(&self.address),
@@ -387,6 +427,11 @@ impl Peripheral {
             r.mtu,
             r.auth_errors,
             r.paired as u8,
+            r.auth_pairings,
+            r.late_fails,
+            r.passkey_waits,
+            r.passkey.map_or("-".into(), |v| format!("{v:06}")),
+            r.authenticated as u8,
             r.ltk_reuse,
             r.encrypted as u8,
             r.subscribed as u8,

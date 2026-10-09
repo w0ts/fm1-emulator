@@ -190,6 +190,7 @@ fn run() -> Result<(), String> {
         })
         .transpose()?
         .unwrap_or_default();
+    let mut typist = passkey_typist()?;
     let mut op_pcs = BTreeMap::<u32, u64>::new();
     // Optional: FM1_IDLE_SKIP=0 steps every slot of a core halted in `idle`
     // instead of jumping to the next device event (same guest state).
@@ -219,6 +220,9 @@ fn run() -> Result<(), String> {
                 next = step + skipped;
                 continue;
             }
+        }
+        if let Some(t) = typist.as_mut() {
+            t.poll(&mut cpu, step);
         }
         let mut contacts_changed = false;
         if let Some(i) = presses.iter().position(|p| p.0 <= step) {
@@ -619,6 +623,64 @@ fn setup_ble(cpu: &mut Cpu) -> Result<bool, String> {
     config.answer_smp = env::var("FM1_BLE_SMP").map_or(true, |v| v != "ignore");
     cpu.bus.ble_attach_central(Central::new(config, steps));
     Ok(true)
+}
+
+/// The phone's user of a virtual peripheral that waits for a passkey
+/// (`auth`): FM1_BLE_PASSKEY_AT=ADDR[:STEPS] reads the passkey the FM-1
+/// shows from the guest's RAM (a u32 at ADDR, hex: the firmware's
+/// `smp_passkey`, 0xFFFFFFFF while none is shown) once a peripheral has
+/// waited STEPS instructions (default 150,000,000: ~1.5 s at 96 MHz, the
+/// time to read and type it), and types it.
+struct PasskeyTypist {
+    addr: u32,
+    delay: u64,
+    next_check: u64,
+    since: Vec<Option<u64>>,
+}
+
+fn passkey_typist() -> Result<Option<PasskeyTypist>, String> {
+    let Ok(spec) = env::var("FM1_BLE_PASSKEY_AT") else {
+        return Ok(None);
+    };
+    let (addr, delay) = spec.split_once(':').unwrap_or((spec.as_str(), "150000000"));
+    let addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16)
+        .map_err(|_| "FM1_BLE_PASSKEY_AT=ADDR[:STEPS]: ADDR in hex")?;
+    let delay = delay
+        .parse()
+        .map_err(|_| "FM1_BLE_PASSKEY_AT=ADDR[:STEPS]: STEPS a number")?;
+    Ok(Some(PasskeyTypist {
+        addr,
+        delay,
+        next_check: 0,
+        since: Vec::new(),
+    }))
+}
+
+impl PasskeyTypist {
+    fn poll(&mut self, cpu: &mut Cpu, step: u64) {
+        if step < self.next_check {
+            return;
+        }
+        self.next_check = step + 100_000;
+        let shown = cpu.bus.read(self.addr, 4).ok();
+        let peripherals = &mut cpu.bus.ble_engine_mut().peripherals;
+        self.since.resize(peripherals.len(), None);
+        for (p, since) in peripherals.iter_mut().zip(self.since.iter_mut()) {
+            if !p.wants_passkey() {
+                *since = None;
+                continue;
+            }
+            let t0 = *since.get_or_insert(step);
+            match shown {
+                Some(v) if v < 1_000_000 && step - t0 >= self.delay => {
+                    eprintln!("ble_passkey typed={v:06} step={step}");
+                    p.type_passkey(v);
+                    *since = None;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn report_ble(cpu: &Cpu) -> Result<(), String> {

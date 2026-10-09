@@ -402,6 +402,7 @@ impl Peripheral {
                 let ediv = u16_at(9);
                 let mut skdm = [0u8; 8];
                 skdm.copy_from_slice(&p[11..19]);
+                self.enc_request(&rand, ediv);
                 let ltk = self.ltk_for(&rand, ediv);
                 let mut fresh = [0u8; 16];
                 fill(&mut self.rng, &mut fresh);
