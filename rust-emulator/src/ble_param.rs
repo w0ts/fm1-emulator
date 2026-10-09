@@ -40,6 +40,8 @@ pub mod field {
     pub const EVTCOUNT: u32 = 0x058;
     pub const TXBUF0CNTL: u32 = 0x064;
     pub const RXBUF0CNTL: u32 = 0x066;
+    /// RSSI2 (§3 0x138 + 4): the word software converts to dBm.
+    pub const RSSI2: u32 = 0x13C;
     pub const FRQ_IDX1: u32 = 0x090;
 }
 

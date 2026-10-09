@@ -19,8 +19,12 @@ use crate::ble_param::{field, Block, Window};
 
 mod advertising;
 mod connection;
+mod scanning;
 #[cfg(test)]
 mod tests;
+
+pub use scanning::{Advertiser, MIDI_UUID};
+use scanning::{PendingRx, ScanWin};
 
 /// Interrupt sources (§10 [M]): the event interrupt and the RX interrupt.
 pub const EVENT_IRQ: usize = 45;
@@ -101,6 +105,14 @@ pub struct EngineConfig {
     pub rx_needs_armed: bool,
     /// Seed of the advDelay generator (Core: 0–10 ms pseudo-random).
     pub seed: u32,
+    /// §21.9 C2: while scanning the engine sets RXBUFnCNTL bit0 on the
+    /// buffer it filled (the vendor's connection-path rule). False: it
+    /// leaves it 0, as the FM-1 did while advertising (§8.1).
+    pub scan_cntl: bool,
+    /// §21.9 C1: the engine writes the advertiser's AdvA into the SCAN_REQ
+    /// (software leaves zeros there). False: the zeros go out and no
+    /// advertiser answers.
+    pub scan_adva: bool,
 }
 
 impl EngineConfig {
@@ -145,6 +157,8 @@ impl EngineConfig {
                 "rx_count_repeats" => self.rx_count_repeats = flag()?,
                 "rx_needs_armed" => self.rx_needs_armed = flag()?,
                 "seed" => self.seed = value.parse().map_err(|_| "seed: a number")?,
+                "scan_cntl" => self.scan_cntl = flag()?,
+                "scan_adva" => self.scan_adva = flag()?,
                 _ => return Err(format!("unknown engine setting {key}")),
             }
         }
@@ -171,6 +185,8 @@ impl Default for EngineConfig {
             instant_gating: true,
             rx_needs_armed: false,
             seed: 0x1234_5678,
+            scan_cntl: true,
+            scan_adva: true,
         }
     }
 }
@@ -191,6 +207,12 @@ pub struct EngineStats {
     pub tx_retransmit: u64,
     pub event_irqs: u64,
     pub rx_irqs: u64,
+    /// Scanning (state 1): windows opened, reports stored, the engine's
+    /// SCAN_REQs, and SCAN_RSPs heard.
+    pub scan_windows: u64,
+    pub scan_reports: u64,
+    pub scan_reqs: u64,
+    pub scan_responses_heard: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +222,8 @@ enum Action {
     ConnOpen,
     ConnClose,
     ConnTx,
+    ScanOpen,
+    ScanEnd,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +267,7 @@ struct Link {
     adv_start: u64,
     connect_end: Option<u64>,
     conn: Option<Conn>,
+    scan: Option<ScanWin>,
 }
 
 pub struct Engine {
@@ -268,6 +293,9 @@ pub struct Engine {
     expect: Option<u64>,
     random: u32,
     central: Option<Central>,
+    /// Devices advertising on the virtual air (scanning hears them).
+    pub advertisers: Vec<Advertiser>,
+    pending_rx: Vec<PendingRx>,
     air: Vec<AirRecord>,
     air_count: u64,
     notes: Vec<String>,
@@ -297,6 +325,8 @@ impl Default for Engine {
             expect: None,
             random: 0,
             central: None,
+            advertisers: Vec::new(),
+            pending_rx: Vec::new(),
             air: Vec::new(),
             air_count: 0,
             notes: Vec::new(),
@@ -542,9 +572,10 @@ impl Engine {
                 self.links[link].action = Some((start, Action::AdvPdu(0)));
                 self.note(format!("link {link} advertising started"));
             }
+            1 => self.start_scan(link),
             _ => self.note(format!(
-                "link {link} started in state {state}: only advertising (2) and the peripheral \
-                 connection (7, from a CONNECT_IND) are modeled"
+                "link {link} started in state {state}: only scanning (1), advertising (2) and the \
+                 peripheral connection (7, from a CONNECT_IND) are modeled"
             )),
         }
     }
@@ -559,6 +590,8 @@ impl Engine {
             .chain(irqs)
             .chain(central)
             .chain(self.expect)
+            .chain(self.next_pending_tick())
+            .chain(self.next_advertiser_tick())
             .min()
             .map(|t| t.max(self.now))
     }
@@ -609,6 +642,12 @@ impl Engine {
                 }
             }
         }
+        if self.store_pending(w)? {
+            return Ok(());
+        }
+        if self.next_advertiser_tick().is_some_and(|t| t <= now) {
+            return self.advertiser_sends(w);
+        }
         if self
             .central
             .as_ref()
@@ -642,6 +681,11 @@ impl Engine {
                 Ok(())
             }
             Action::ConnTx => self.conn_tx(link, block, w),
+            Action::ScanOpen => self.scan_open(link, block, w),
+            Action::ScanEnd => {
+                self.scan_end(link);
+                Ok(())
+            }
         }
     }
 }

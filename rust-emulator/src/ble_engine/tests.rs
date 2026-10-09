@@ -403,3 +403,197 @@ fn dma_outside_the_window_faults() {
     let error = (0..400).find_map(|_| rig.engine.advance(24_000, ram).err());
     assert!(error.unwrap().contains("outside the baseband RAM window"));
 }
+
+// ---- scanning (state 1, §21.2) against virtual advertisers
+
+const SCANNER: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0xC6];
+
+impl Rig {
+    /// A link set up for scanning the way the firmware's driver does it
+    /// (§21.2 steps 1-13): window 60 slots of a 64-slot interval, channel
+    /// 37, both TX buffers a SCAN_REQ with six zero octets for AdvA.
+    fn scanning(advertisers: Vec<Advertiser>, config: EngineConfig, active: bool) -> Self {
+        let mut rig = Rig {
+            engine: Engine {
+                config,
+                advertisers,
+                ..Engine::default()
+            },
+            ram: vec![0; RAM_SIZE],
+        };
+        rig.engine.set_ram_window(Some(BASE), Some(BASE + 0x1000));
+        rig.w().set_u16(0, 0x8000 | BLOCK as u16).unwrap();
+        for (i, (tx, rx)) in [(0x800u16, 0x400u16), (0x900, 0x600)]
+            .into_iter()
+            .enumerate()
+        {
+            let i = i as u32;
+            rig.set(field::TXPTR0 + 2 * i, tx);
+            rig.set(field::RXPTR0 + 2 * i, rx);
+            let mut req = SCANNER.to_vec();
+            req.extend([0; 6]);
+            rig.w().set_bytes(tx as u32, &req).unwrap();
+            rig.set(field::TXAHDR0 + 2 * i, 0x13);
+            rig.set(field::TXDHDR0 + 2 * i, 12 << 8);
+        }
+        rig.set(field::RXMAXBUF, 255);
+        rig.set(field::WINCNTL0, (60 * 625) as u16);
+        rig.set(field::FORMAT, if active { 0 } else { 0x100 });
+        rig.engine.write(0x28000, 1, 4).unwrap();
+        rig.column(1, 64);
+        rig.column(15, 0);
+        rig.column(8, 0);
+        rig.column(6, 0x2100 | 37);
+        rig.column(2, 0x1000);
+        rig.engine.write(0x28028, 0x101, 4).unwrap();
+        rig.column(0, 0);
+        rig.column(14, 0x8000);
+        rig
+    }
+
+    /// The firmware's interrupt handlers, minimally: the event ISR writes
+    /// the next channel; the RX ISR takes the RXBUFnCNTL-marked buffers.
+    /// Returns the reports taken (header + payload) with their channels.
+    fn scan_for(&mut self, ms: u64) -> Vec<(Vec<u8>, u8, u16)> {
+        let mut out = Vec::new();
+        let mut ch = 38;
+        for _ in 0..ms * 4 {
+            self.run(6_000);
+            let pending = self.engine.read(0x28030, 4).unwrap();
+            if pending & 1 != 0 {
+                self.engine.write(0x2802C, 1, 4).unwrap();
+                self.column(6, 0x2100 | ch);
+                ch = if ch == 39 { 37 } else { ch + 1 };
+            }
+            if pending & 0x100 != 0 {
+                self.engine.write(0x2802C, 0x100, 4).unwrap();
+                for b in 0..2u32 {
+                    if self.get8(field::RXBUF0CNTL + b) & 1 != 0 {
+                        let len = (self.get(field::RXDHDR0 + 2 * b) >> 8) as u32;
+                        let ptr = self.get(field::RXPTR0 + 2 * b) as u32;
+                        let mut pdu = vec![self.get(field::RXAHDR0 + 2 * b) as u8, len as u8];
+                        pdu.extend(self.w().bytes(ptr, len).unwrap());
+                        let channel = self.get(field::LASTCHMAP) as u8;
+                        let rssi = self.get(field::RSSI2);
+                        out.push((pdu, channel, rssi));
+                        self.set8(field::RXBUF0CNTL + b, 0);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+fn midi_controller() -> Advertiser {
+    let mut a = Advertiser::midi("KeyStep 37", [0x37, 0x37, 0x4B, 0x65, 0x79, 0xC4], true);
+    a.rssi = 0x0805;
+    a.interval_ms = 20; // (often enough to meet every channel's window soon)
+    a
+}
+
+#[test]
+fn scanning_hears_adv_ind_and_its_scan_response_on_every_channel() {
+    let mut rig = Rig::scanning(vec![midi_controller()], EngineConfig::default(), true);
+    let reports = rig.scan_for(600);
+    let advs: Vec<_> = reports
+        .iter()
+        .filter(|r| r.0[0] & 15 == adv::ADV_IND)
+        .collect();
+    let rsps: Vec<_> = reports
+        .iter()
+        .filter(|r| r.0[0] & 15 == adv::SCAN_RSP)
+        .collect();
+    assert!(
+        advs.len() > 3 && rsps.len() > 3,
+        "{} ADV_IND, {} SCAN_RSP",
+        advs.len(),
+        rsps.len()
+    );
+    let a = advs[0];
+    assert_eq!(a.0[0], 0x40, "ADV_IND, TxAdd random");
+    assert_eq!(&a.0[2..8], &[0x37, 0x37, 0x4B, 0x65, 0x79, 0xC4]);
+    assert_eq!(&a.0[13..29], &MIDI_UUID);
+    assert_eq!(a.2, 0x0805, "RSSI2");
+    assert!(rsps[0].0.windows(10).any(|w| w == b"KeyStep 37"));
+    let channels: std::collections::BTreeSet<u8> = advs.iter().map(|r| r.1).collect();
+    assert_eq!(channels.into_iter().collect::<Vec<_>>(), [37, 38, 39]);
+    // the engine's SCAN_REQ: ScanA ours, AdvA filled in (C1 = on)
+    let req = rig
+        .engine
+        .air_log()
+        .iter()
+        .find(|r| r.pdu[0] & 15 == adv::SCAN_REQ)
+        .unwrap();
+    assert_eq!(&req.pdu[2..8], &SCANNER);
+    assert_eq!(&req.pdu[8..14], &[0x37, 0x37, 0x4B, 0x65, 0x79, 0xC4]);
+    assert!(rig.engine.stats.scan_windows > 10);
+}
+
+#[test]
+fn a_scan_window_listens_on_the_channel_column_6_had_when_it_opened() {
+    let mut rig = Rig::scanning(vec![midi_controller()], EngineConfig::default(), false);
+    // no event ISR rewriting column 6: the scanner stays on 37
+    rig.run(300 * 24_000);
+    let heard: Vec<_> = rig
+        .engine
+        .air_log()
+        .iter()
+        .filter(|r| r.sender == Sender::Advertiser)
+        .map(|r| r.channel)
+        .collect();
+    assert!(
+        !heard.is_empty() && heard.iter().all(|c| *c == 37),
+        "{heard:?}"
+    );
+}
+
+#[test]
+fn passive_scanning_sends_no_scan_request() {
+    let mut rig = Rig::scanning(vec![midi_controller()], EngineConfig::default(), false);
+    let reports = rig.scan_for(400);
+    assert!(reports.iter().any(|r| r.0[0] & 15 == adv::ADV_IND));
+    assert!(!reports.iter().any(|r| r.0[0] & 15 == adv::SCAN_RSP));
+    assert_eq!(rig.engine.stats.scan_reqs, 0);
+}
+
+#[test]
+fn without_adva_filled_in_no_advertiser_answers() {
+    let mut config = EngineConfig::default();
+    config.apply("scan_adva=0").unwrap();
+    let mut rig = Rig::scanning(vec![midi_controller()], config, true);
+    let reports = rig.scan_for(400);
+    assert!(rig.engine.stats.scan_reqs > 0);
+    assert!(!reports.iter().any(|r| r.0[0] & 15 == adv::SCAN_RSP));
+}
+
+#[test]
+fn without_scan_cntl_the_buffer_is_not_marked_but_rxtog_moves() {
+    let mut config = EngineConfig::default();
+    config.apply("scan_cntl=0").unwrap();
+    let mut rig = Rig::scanning(vec![midi_controller()], config, false);
+    let reports = rig.scan_for(300);
+    assert!(reports.is_empty(), "RXBUFnCNTL bit0 never set");
+    assert!(rig.engine.stats.scan_reports > 0);
+    assert_ne!(
+        rig.get(field::RXTOG) & 1 | rig.get(field::RXAHDR0) | rig.get(field::RXAHDR0 + 2),
+        0
+    );
+}
+
+#[test]
+fn a_stopped_scan_hears_nothing_and_the_defaults_parse() {
+    let mut rig = Rig::scanning(Advertiser::defaults(), EngineConfig::default(), true);
+    rig.run(200 * 24_000);
+    let before = rig.engine.stats.scan_reports;
+    assert!(before > 0);
+    rig.column(14, 0);
+    rig.run(300 * 24_000);
+    assert_eq!(rig.engine.stats.scan_reports, before);
+    let v = Advertiser::parse("midi:Pad:adv:ms=50;beacon:Tag").unwrap();
+    assert_eq!(v.len(), 2);
+    assert_eq!(v[0].interval_ms, 50);
+    assert!(v[0].adv_data.windows(3).any(|w| w == b"Pad"));
+    assert!(Advertiser::parse("radio:X").is_err());
+    assert_eq!(Advertiser::parse("default").unwrap().len(), 6);
+}

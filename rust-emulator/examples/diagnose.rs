@@ -553,14 +553,20 @@ fn run() -> Result<(), String> {
 /// FM1_BLE_CENTRAL=script|scan puts the virtual central on the air:
 /// `script` runs FM1_BLE_SCRIPT=PATH (default: the built-in script),
 /// `scan` only scans. FM1_BLE_MODEL=key=value,... sets engine hypotheses
-/// (ble_engine::EngineConfig::apply). Returns whether BLE reporting is on.
+/// (ble_engine::EngineConfig::apply). FM1_BLE_ADVERTISERS=default|SPEC puts
+/// virtual advertisers on the air for a scanning FM-1 to hear
+/// (ble_engine::Advertiser::parse). Returns whether BLE reporting is on.
 fn setup_ble(cpu: &mut Cpu) -> Result<bool, String> {
     use fm1_emu::ble_central::{script, Central, CentralConfig, Step};
     if let Ok(settings) = env::var("FM1_BLE_MODEL") {
         cpu.bus.ble_engine_mut().config.apply(&settings)?;
     }
+    let advertisers = env::var("FM1_BLE_ADVERTISERS").ok();
+    if let Some(spec) = &advertisers {
+        cpu.bus.ble_engine_mut().advertisers = fm1_emu::ble_engine::Advertiser::parse(spec)?;
+    }
     let steps = match env::var("FM1_BLE_CENTRAL").as_deref() {
-        Err(_) | Ok("off") => return Ok(env::var("FM1_BLE_MODEL").is_ok()),
+        Err(_) | Ok("off") => return Ok(env::var("FM1_BLE_MODEL").is_ok() || advertisers.is_some()),
         Ok("scan") => vec![Step::Scan(u32::MAX)],
         Ok("script") => match env::var("FM1_BLE_SCRIPT") {
             Ok(path) => {
@@ -596,6 +602,12 @@ fn setup_ble(cpu: &mut Cpu) -> Result<bool, String> {
 fn report_ble(cpu: &Cpu) -> Result<(), String> {
     let engine = cpu.bus.ble_engine();
     eprintln!("BLE engine: {:?}", engine.stats);
+    for a in &engine.advertisers {
+        eprintln!(
+            "  advertiser {:<14} {:02x?} sent {} scan_req {} scan_rsp {}",
+            a.name, a.address, a.sent, a.scan_reqs, a.scan_rsps
+        );
+    }
     for note in engine.notes() {
         eprintln!("  model: {note}");
     }
