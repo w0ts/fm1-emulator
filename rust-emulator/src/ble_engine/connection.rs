@@ -9,13 +9,13 @@
 use super::*;
 
 /// A packet from the central, as the RX side stores it.
-struct Received<'a> {
-    pdu: &'a [u8],
-    counter: u16,
-    channel: u8,
+pub(super) struct Received<'a> {
+    pub pdu: &'a [u8],
+    pub counter: u16,
+    pub channel: u8,
     /// It acknowledged our last PDU (RXSTAT bit8).
-    acked: bool,
-    end: u64,
+    pub acked: bool,
+    pub end: u64,
 }
 
 impl Engine {
@@ -77,7 +77,13 @@ impl Engine {
     /// column 6 [12:8] (§2.3 [M:s]), the used-channel bits of CHMAP0/1/2 and
     /// FRQ_IDX1 as the remapping table, CHMAP2 [15:5] used channels (§3
     /// [M:d]; that the engine reads them is [I]).
-    fn next_channel(&self, link: usize, block: Block, w: &Window, last: u8) -> Res<(u8, u8)> {
+    pub(super) fn next_channel(
+        &self,
+        link: usize,
+        block: Block,
+        w: &Window,
+        last: u8,
+    ) -> Res<(u8, u8)> {
         let hop = ((self.columns[6][link] >> 8) & 31) as u8;
         let (map, used) = block.channel_map(w)?;
         if used == 0 || used > 37 {
@@ -308,7 +314,7 @@ impl Engine {
     /// RXDHDRn takes the Core header ([1:0] LLID, bit2 NESN, bit3 SN, bit4
     /// MD, [15:8] length), RXSTATn = 1 | ack << 8, EVTCOUNT the counter,
     /// LASTCHMAP the channel (§3, §8 IRQ 29 step 4 [M:s]).
-    fn store_conn_rx(
+    pub(super) fn store_conn_rx(
         &mut self,
         link: usize,
         block: Block,

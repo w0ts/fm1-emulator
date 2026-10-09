@@ -16,15 +16,21 @@ use crate::ble_air::{
 };
 use crate::ble_central::{Central, CentralTx};
 use crate::ble_param::{field, Block, Window};
+use crate::ble_peripheral::Peripheral;
 
 mod advertising;
+mod central;
+#[cfg(test)]
+mod central_tests;
 mod connection;
 mod scanning;
 #[cfg(test)]
 mod tests;
 
+use central::{MasterConn, MasterSetup};
+use connection::Received;
 pub use scanning::{Advertiser, MIDI_UUID};
-use scanning::{PendingRx, ScanWin};
+use scanning::{AirSource, PendingRx, ScanWin};
 
 /// Interrupt sources (§10 [M]): the event interrupt and the RX interrupt.
 pub const EVENT_IRQ: usize = 45;
@@ -113,6 +119,21 @@ pub struct EngineConfig {
     /// (software leaves zeros there). False: the zeros go out and no
     /// advertiser answers.
     pub scan_adva: bool,
+    /// §21.9 C3: while initiating, the engine answers the target's ADV_IND
+    /// (or an ADV_DIRECT_IND to LOCALADR) with the CONNECT_IND software
+    /// left in the TXTOG buffer, by itself. False: nothing is sent.
+    pub init_cind: bool,
+    /// §21.9 C4: with column 9 bit0 set the engine stops initiating after
+    /// its CONNECT_IND and raises the event interrupt at its end. False:
+    /// at the end of that scan window.
+    pub init_evt_after_cind: bool,
+    /// §21.9 C5: the master's first anchor is the anchor counter's (column
+    /// 0 + 1 slots after software started it with column 14). False: the
+    /// transmit window's start (1.25 ms + WinOffset after the CONNECT_IND).
+    pub master_anchor_from_counter: bool,
+    /// §21.9 C6: the master transmits first at each anchor. False: it
+    /// sends nothing (and so hears nothing).
+    pub master_tx_first: bool,
 }
 
 impl EngineConfig {
@@ -159,6 +180,10 @@ impl EngineConfig {
                 "seed" => self.seed = value.parse().map_err(|_| "seed: a number")?,
                 "scan_cntl" => self.scan_cntl = flag()?,
                 "scan_adva" => self.scan_adva = flag()?,
+                "init_cind" => self.init_cind = flag()?,
+                "init_evt_after_cind" => self.init_evt_after_cind = flag()?,
+                "master_anchor_from_counter" => self.master_anchor_from_counter = flag()?,
+                "master_tx_first" => self.master_tx_first = flag()?,
                 _ => return Err(format!("unknown engine setting {key}")),
             }
         }
@@ -187,6 +212,10 @@ impl Default for EngineConfig {
             seed: 0x1234_5678,
             scan_cntl: true,
             scan_adva: true,
+            init_cind: true,
+            init_evt_after_cind: true,
+            master_anchor_from_counter: true,
+            master_tx_first: true,
         }
     }
 }
@@ -213,6 +242,16 @@ pub struct EngineStats {
     pub scan_reports: u64,
     pub scan_reqs: u64,
     pub scan_responses_heard: u64,
+    /// The central role (states 3 and 6): initiating windows, the engine's
+    /// CONNECT_INDs, master events, the master's PDUs (data, empty,
+    /// resent) and the peripheral's replies heard.
+    pub init_windows: u64,
+    pub connect_inds_sent: u64,
+    pub master_events: u64,
+    pub master_tx_data: u64,
+    pub master_tx_empty: u64,
+    pub master_tx_retransmit: u64,
+    pub master_rx: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +263,8 @@ enum Action {
     ConnTx,
     ScanOpen,
     ScanEnd,
+    MasterTx,
+    MasterEnd,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +309,7 @@ struct Link {
     connect_end: Option<u64>,
     conn: Option<Conn>,
     scan: Option<ScanWin>,
+    master: Option<MasterConn>,
 }
 
 pub struct Engine {
@@ -295,6 +337,9 @@ pub struct Engine {
     central: Option<Central>,
     /// Devices advertising on the virtual air (scanning hears them).
     pub advertisers: Vec<Advertiser>,
+    /// Connectable BLE-MIDI peripherals the FM-1 can connect to as central.
+    pub peripherals: Vec<Peripheral>,
+    pending_master: [Option<MasterSetup>; LINKS],
     pending_rx: Vec<PendingRx>,
     air: Vec<AirRecord>,
     air_count: u64,
@@ -326,6 +371,8 @@ impl Default for Engine {
             random: 0,
             central: None,
             advertisers: Vec::new(),
+            peripherals: Vec::new(),
+            pending_master: Default::default(),
             pending_rx: Vec::new(),
             air: Vec::new(),
             air_count: 0,
@@ -550,6 +597,10 @@ impl Engine {
             // Column 2 state 7 after a CONNECT_IND: the peripheral connection
             // (§7 step 9 [M:s]).
             2 if (data >> 12) & 7 == 7 && self.links[link].running => self.begin_connection(link),
+            // Column 2 state 6 after the engine's CONNECT_IND: the master
+            // (§21.3 "Switch to master" [IR]).
+            2 if (data >> 12) & 7 == 6 => self.begin_master(link),
+            2 if (data >> 12) & 7 != 3 => self.pending_master[link] = None,
             _ => {}
         }
     }
@@ -573,9 +624,10 @@ impl Engine {
                 self.note(format!("link {link} advertising started"));
             }
             1 => self.start_scan(link),
+            3 => self.start_initiating(link),
             _ => self.note(format!(
-                "link {link} started in state {state}: only scanning (1), advertising (2) and the \
-                 peripheral connection (7, from a CONNECT_IND) are modeled"
+                "link {link} started in state {state}: only scanning (1), advertising (2), \
+                 initiating (3) and the connections (6 and 7, after a CONNECT_IND) are modeled"
             )),
         }
     }
@@ -592,6 +644,7 @@ impl Engine {
             .chain(self.expect)
             .chain(self.next_pending_tick())
             .chain(self.next_advertiser_tick())
+            .chain(self.next_peripheral_tick())
             .min()
             .map(|t| t.max(self.now))
     }
@@ -648,6 +701,9 @@ impl Engine {
         if self.next_advertiser_tick().is_some_and(|t| t <= now) {
             return self.advertiser_sends(w);
         }
+        if self.next_peripheral_tick().is_some_and(|t| t <= now) {
+            return self.peripheral_step(w);
+        }
         if self
             .central
             .as_ref()
@@ -684,6 +740,11 @@ impl Engine {
             Action::ScanOpen => self.scan_open(link, block, w),
             Action::ScanEnd => {
                 self.scan_end(link);
+                Ok(())
+            }
+            Action::MasterTx => self.master_tx(link, block, w),
+            Action::MasterEnd => {
+                self.master_end(link);
                 Ok(())
             }
         }

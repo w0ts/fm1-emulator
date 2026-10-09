@@ -214,6 +214,13 @@ pub(super) struct ScanWin {
     pub open: bool,
 }
 
+/// Who put an advertising PDU on the air.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AirSource {
+    Advertiser(usize),
+    Peripheral(usize),
+}
+
 /// A packet the scanner received, stored when it ends.
 #[derive(Clone, Debug)]
 pub(super) struct PendingRx {
@@ -255,7 +262,11 @@ impl Engine {
             channel,
             open: true,
         });
-        self.stats.scan_windows += 1;
+        if self.link_state(link) == 3 {
+            self.stats.init_windows += 1;
+        } else {
+            self.stats.scan_windows += 1;
+        }
         self.links[link].action = Some((end, Action::ScanEnd));
         Ok(())
     }
@@ -267,6 +278,15 @@ impl Engine {
             return;
         };
         self.raise(link, false);
+        // Initiating ends with the engine's CONNECT_IND when column 9 bit0
+        // is set (§21.3 step 8 [I]).
+        if self.link_state(link) == 3
+            && self.pending_master[link].is_some()
+            && self.columns[9][link] & 1 != 0
+        {
+            self.links[link].scan = None;
+            return;
+        }
         let next = (s.start + self.interval_slots(link).max(1) * SLOT).max(self.now + 1);
         self.links[link].scan = Some(ScanWin {
             open: false,
@@ -280,7 +300,7 @@ impl Engine {
     fn scanner_on(&self, channel: u8) -> Option<usize> {
         (0..LINKS).find(|&l| {
             self.links[l].running
-                && self.link_state(l) == 1
+                && matches!(self.link_state(l), 1 | 3)
                 && self.links[l].scan.is_some_and(|s| {
                     s.open && s.channel == channel && s.start <= self.now && self.now < s.end
                 })
@@ -309,7 +329,7 @@ impl Engine {
         }
         self.pending_rx.retain(|p| p.at > now);
         for p in due {
-            if !self.links[p.link].running || self.link_state(p.link) != 1 {
+            if !self.links[p.link].running || !matches!(self.link_state(p.link), 1 | 3) {
                 continue;
             }
             let Some(block) = w.link(p.link)? else {
@@ -360,8 +380,27 @@ impl Engine {
             a.next = now + (a.interval_ms as u64 * 1_000 + delay) * TICKS_PER_US
                 - 2 * ADV_SPACING_US * TICKS_PER_US;
         }
-        let (address, kind, rssi, rsp) = (a.address, a.kind, a.rssi, a.scan_rsp.clone());
+        let (rssi, rsp) = (a.rssi, a.scan_rsp.clone());
         let rsp_pdu = rsp.map(|d| self.advertisers[i].pdu(adv::SCAN_RSP, &d));
+        self.air_adv(w, AirSource::Advertiser(i), channel, pdu, rsp_pdu, rssi)
+    }
+
+    /// An advertising PDU on `channel` now: a scanning link stores it (and
+    /// its engine may send a SCAN_REQ, answered by the SCAN_RSP `rsp`); an
+    /// initiating link may answer it with the CONNECT_IND.
+    pub(super) fn air_adv(
+        &mut self,
+        w: &mut Window,
+        src: AirSource,
+        channel: u8,
+        pdu: Vec<u8>,
+        rsp_pdu: Option<Vec<u8>>,
+        rssi: u16,
+    ) -> Res<()> {
+        let now = self.now;
+        let kind = pdu[0] & 15;
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&pdu[2..8]);
         let end = now + airtime_ticks(pdu.len() - 2);
         let Some(link) = self.scanner_on(channel) else {
             return Ok(());
@@ -373,15 +412,28 @@ impl Engine {
             channel,
             rssi,
         });
+        let initiating = self.link_state(link) == 3;
         self.log(AirRecord {
             tick: now,
             sender: Sender::Advertiser,
             channel,
             access_address: ADV_ACCESS_ADDRESS,
             event: None,
-            pdu,
-            note: "heard by the scanner".into(),
+            pdu: pdu.clone(),
+            note: if initiating {
+                "heard by the initiator".into()
+            } else {
+                "heard by the scanner".into()
+            },
         });
+        if initiating {
+            if let Some((at, cind_end, cind)) = self.initiator_hears(link, w, &pdu, end, channel)? {
+                if let AirSource::Peripheral(i) = src {
+                    self.peripherals[i].connect_ind(at, cind_end, &cind);
+                }
+            }
+            return Ok(());
+        }
         let block = w
             .link(link)?
             .ok_or("a scanning link has no control block")?;
@@ -420,8 +472,13 @@ impl Engine {
         if !answered {
             return Ok(());
         }
-        self.advertisers[i].scan_reqs += 1;
-        self.advertisers[i].scan_rsps += 1;
+        match src {
+            AirSource::Advertiser(i) => {
+                self.advertisers[i].scan_reqs += 1;
+                self.advertisers[i].scan_rsps += 1;
+            }
+            AirSource::Peripheral(i) => self.peripherals[i].scan_request(),
+        }
         let rsp = rsp_pdu.unwrap_or_default();
         let rsp_at = req_end + T_IFS;
         self.pending_rx.push(PendingRx {

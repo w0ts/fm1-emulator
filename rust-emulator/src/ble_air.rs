@@ -170,6 +170,10 @@ pub enum Sender {
     Central,
     /// A virtual advertiser that only the scanner hears (ble_engine::Advertiser).
     Advertiser,
+    /// The FM-1 as the master of a connection (it initiated).
+    Master,
+    /// A virtual peripheral (ble_peripheral) in a connection the FM-1 made.
+    Slave,
 }
 
 /// One packet on the virtual air, in time order.
@@ -194,6 +198,8 @@ impl std::fmt::Display for AirRecord {
             Sender::Peripheral => "P->C",
             Sender::Central => "C->P",
             Sender::Advertiser => "A->S",
+            Sender::Master => "M->S",
+            Sender::Slave => "S->M",
         };
         let event = self.event.map_or("  -  ".into(), |e| format!("{e:5}"));
         let hex: Vec<_> = self.pdu.iter().map(|b| format!("{b:02x}")).collect();

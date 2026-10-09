@@ -36,6 +36,7 @@ pub mod field {
     pub const CRCWORD1: u32 = 0x046;
     pub const WIDEN0: u32 = 0x048;
     pub const WIDEN1: u32 = 0x04A;
+    pub const TARGETADR: u32 = 0x04C;
     pub const LOCALADR: u32 = 0x052;
     pub const EVTCOUNT: u32 = 0x058;
     pub const TXBUF0CNTL: u32 = 0x064;
