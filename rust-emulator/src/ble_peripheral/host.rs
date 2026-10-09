@@ -72,7 +72,7 @@ pub(super) struct Host {
     sig_id: u8,
     upd_sent: bool,
     /// The link's key is authenticated (now; and the one being started).
-    link_auth: bool,
+    pub(super) link_auth: bool,
     pending_auth: bool,
 }
 

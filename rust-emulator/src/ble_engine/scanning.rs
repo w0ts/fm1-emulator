@@ -429,7 +429,15 @@ impl Engine {
         if initiating {
             if let Some((at, cind_end, cind)) = self.initiator_hears(link, w, &pdu, end, channel)? {
                 if let AirSource::Peripheral(i) = src {
-                    self.peripherals[i].connect_ind(at, cind_end, &cind);
+                    if self.stats.connect_inds_sent == self.config.cind_lost_n() {
+                        self.stats.cind_lost += 1;
+                        self.note(format!(
+                            "link {link}: CONNECT_IND {} not heard by its peripheral (cind_lost)",
+                            self.stats.connect_inds_sent
+                        ));
+                    } else {
+                        self.peripherals[i].connect_ind(at, cind_end, &cind);
+                    }
                 }
             }
             return Ok(());

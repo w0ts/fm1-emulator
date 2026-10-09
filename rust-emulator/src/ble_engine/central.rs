@@ -151,7 +151,8 @@ impl Engine {
             if self.config.init_evt_after_cind {
                 self.links[link].scan = None;
                 self.links[link].action = None;
-                self.irq_due.push((cind_end, link, false));
+                let late = self.config.init_evt_delay_us as u64 * TICKS_PER_US;
+                self.irq_due.push((cind_end + late, link, false));
             } else if let Some(s) = self.links[link].scan.as_mut() {
                 s.start = u64::MAX; // no window after this one
             }

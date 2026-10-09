@@ -18,6 +18,9 @@ const ENC_REQ: u8 = 0x03;
 const ENC_RSP: u8 = 0x04;
 const START_ENC_REQ: u8 = 0x05;
 const START_ENC_RSP: u8 = 0x06;
+/// LL_PAUSE_ENC_REQ / RSP: a new key on an encrypted link (5.1.3.2).
+const PAUSE_ENC_REQ: u8 = 0x0A;
+const PAUSE_ENC_RSP: u8 = 0x0B;
 const PHY_RSP: u8 = 0x17;
 
 pub(super) struct SlaveLink {
@@ -232,6 +235,7 @@ impl SlaveLink {
         }
         let mut pdu = self.queue.pop_front().unwrap_or_else(|| vec![1, 0]);
         let is_start_enc_req = pdu[0] & 3 == 3 && pdu.get(2) == Some(&START_ENC_REQ);
+        let is_pause_rsp = pdu[0] & 3 == 3 && pdu.get(2) == Some(&PAUSE_ENC_RSP);
         if let (Some(c), true) = (self.enc_tx.as_mut(), pdu[1] > 0) {
             let body = c.encrypt(pdu[0], &pdu[2..]);
             pdu.truncate(2);
@@ -243,6 +247,10 @@ impl SlaveLink {
             if let Some((_, rx, _)) = &self.pending {
                 self.enc_rx = Some(rx.clone());
             }
+        }
+        if is_pause_rsp {
+            // Ours went encrypted; the master's LL_PAUSE_ENC_RSP comes plain.
+            self.enc_rx = None;
         }
         let md = !self.queue.is_empty();
         pdu[0] = (pdu[0] & 3) | self.nesn << 2 | self.sn << 3 | (md as u8) << 4;
@@ -336,6 +344,8 @@ impl Peripheral {
         let name = match op {
             ENC_REQ => "LL_ENC_REQ",
             START_ENC_RSP => "LL_START_ENC_RSP",
+            PAUSE_ENC_REQ => "LL_PAUSE_ENC_REQ",
+            PAUSE_ENC_RSP => "LL_PAUSE_ENC_RSP",
             0x18 => "LL_PHY_UPDATE_IND",
             _ => crate::ble_air::ll_name(op),
         };
@@ -433,6 +443,16 @@ impl Peripheral {
                 r.extend(&fresh[8..12]);
                 link.send(r);
                 link.send(vec![3, 1, START_ENC_REQ]);
+            }
+            // The encryption pause (5.1.3.2): ours encrypted, the master's
+            // plain, then both directions plain until its LL_ENC_REQ.
+            PAUSE_ENC_REQ if link.encrypted() => {
+                link.send(vec![3, 1, PAUSE_ENC_RSP]);
+                self.report.pauses += 1;
+            }
+            PAUSE_ENC_RSP if link.enc_tx.is_some() && link.enc_rx.is_none() => {
+                link.enc_tx = None;
+                self.host.link_auth = false;
             }
             START_ENC_RSP => {
                 if let Some((tx, _, bonded)) = link.pending.take() {

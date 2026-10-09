@@ -134,9 +134,34 @@ pub struct EngineConfig {
     /// §21.9 C6: the master transmits first at each anchor. False: it
     /// sends nothing (and so hears nothing).
     pub master_tx_first: bool,
+    /// The event interrupt after the engine's CONNECT_IND comes this many
+    /// µs after its end (0: at its end). On the FM-1 it came 0.2–0.5 ms
+    /// after the target's ADV_IND in the connections that were made, 1.9
+    /// and 4.8 ms in the two that failed with 0x3E (blell-dev3 / dev4).
+    pub init_evt_delay_us: u32,
+    /// §2.1 0x28038 bit1 reads busy this many µs after a running link is
+    /// stopped (column 14 = 0); 0: never busy. On the FM-1 it was still set
+    /// after 2,000 polls (~0.75 ms) each time a scanning link stopped.
+    pub busy_after_stop_us: u32,
+    /// The N-th CONNECT_IND the engine sends is not heard by its
+    /// peripheral (0: none), which goes on advertising: the link fails to
+    /// be established (0x3E), radio life (2 of 6 on the FM-1). `random`:
+    /// N is 1 or 2, from the seed.
+    pub cind_lost: u32,
 }
 
+/// `cind_lost=random`: the first or the second CONNECT_IND, by the seed.
+pub const CIND_LOST_RANDOM: u32 = u32::MAX;
+
 impl EngineConfig {
+    /// The CONNECT_IND (1, 2, ...) that `cind_lost` loses, 0 none.
+    pub fn cind_lost_n(&self) -> u64 {
+        match self.cind_lost {
+            CIND_LOST_RANDOM => 1 + (self.seed >> 3 & 1) as u64,
+            n => n as u64,
+        }
+    }
+
     /// Apply `key=value` settings separated by commas, e.g.
     /// `scan_rsp=software,old_sn=irq,pairs=4`.
     pub fn apply(&mut self, settings: &str) -> Result<(), String> {
@@ -184,6 +209,20 @@ impl EngineConfig {
                 "init_evt_after_cind" => self.init_evt_after_cind = flag()?,
                 "master_anchor_from_counter" => self.master_anchor_from_counter = flag()?,
                 "master_tx_first" => self.master_tx_first = flag()?,
+                "init_evt_delay_us" => {
+                    self.init_evt_delay_us =
+                        value.parse().map_err(|_| "init_evt_delay_us: a number")?
+                }
+                "busy_after_stop_us" => {
+                    self.busy_after_stop_us =
+                        value.parse().map_err(|_| "busy_after_stop_us: a number")?
+                }
+                "cind_lost" => {
+                    self.cind_lost = match value {
+                        "random" => CIND_LOST_RANDOM,
+                        v => v.parse().map_err(|_| "cind_lost: a number or random")?,
+                    }
+                }
                 _ => return Err(format!("unknown engine setting {key}")),
             }
         }
@@ -216,6 +255,9 @@ impl Default for EngineConfig {
             init_evt_after_cind: true,
             master_anchor_from_counter: true,
             master_tx_first: true,
+            init_evt_delay_us: 0,
+            busy_after_stop_us: 0,
+            cind_lost: 0,
         }
     }
 }
@@ -252,6 +294,10 @@ pub struct EngineStats {
     pub master_tx_empty: u64,
     pub master_tx_retransmit: u64,
     pub master_rx: u64,
+    /// CONNECT_INDs its peripheral did not hear (`cind_lost`); stops that
+    /// left 0x28038 bit1 busy (`busy_after_stop_us`).
+    pub cind_lost: u64,
+    pub busy_stops: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -341,6 +387,8 @@ pub struct Engine {
     pub peripherals: Vec<Peripheral>,
     pending_master: [Option<MasterSetup>; LINKS],
     pending_rx: Vec<PendingRx>,
+    /// 0x28038 bit1 reads 1 until this tick (`busy_after_stop_us`).
+    busy_until: u64,
     air: Vec<AirRecord>,
     air_count: u64,
     notes: Vec<String>,
@@ -374,6 +422,7 @@ impl Default for Engine {
             peripherals: Vec::new(),
             pending_master: Default::default(),
             pending_rx: Vec::new(),
+            busy_until: 0,
             air: Vec::new(),
             air_count: 0,
             notes: Vec::new(),
@@ -494,9 +543,16 @@ impl Engine {
             0x2802C => self.acknowledge,
             0x28030 => self.pending,
             // §2.1 [M:s]: bit1 busy (polled to 0 after a link is disabled);
-            // the model completes every radio action instantly, so never
-            // busy. bit7 is never raised by the model.
-            0x28038 => 0,
+            // the model completes every radio action instantly, so busy
+            // only for `busy_after_stop_us` after a stop. bit7 is never
+            // raised by the model.
+            0x28038 => {
+                if self.now < self.busy_until {
+                    2
+                } else {
+                    0
+                }
+            }
             0x2804C => self.group2_enables,
             0x28050 => self.group2_pending,
             _ => self.latches[((address - 0x28000) / 4) as usize],
@@ -588,6 +644,11 @@ impl Engine {
                 l.clock_value = self.columns[0][link] | (data & 0xFF) << 16;
                 if l.running {
                     self.note(format!("link {link} stopped (column 14 = 0)"));
+                    if self.config.busy_after_stop_us > 0 {
+                        self.busy_until =
+                            self.now + self.config.busy_after_stop_us as u64 * TICKS_PER_US;
+                        self.stats.busy_stops += 1;
+                    }
                 }
                 self.links[link] = Link {
                     clock_value: self.links[link].clock_value,

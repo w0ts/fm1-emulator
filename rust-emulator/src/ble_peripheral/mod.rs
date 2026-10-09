@@ -217,6 +217,8 @@ pub struct Report {
     pub authenticated: bool,
     /// Encryptions started with the bond's LTK (EDIV / Rand), not an STK.
     pub ltk_reuse: u32,
+    /// Encryption pauses the master started (a new key on the link).
+    pub pauses: u32,
     pub encrypted: bool,
     pub subscribed: bool,
     pub notifications: u64,
@@ -406,7 +408,7 @@ impl Peripheral {
         format!(
             "ble_peripheral name={} addr={} identity={} adv={} scan_reqs={} conns={} established={} \
              in_window={window} offset_us={} first_event={} events={} ll={} mtu={} auth_errors={} \
-             paired={} auth_pairings={} late_fails={} passkey_waits={} passkey={} authenticated={} \
+             paired={} auth_pairings={} late_fails={} passkey_waits={} passkey={} authenticated={} pauses={} \
              ltk_reuse={} encrypted={} subscribed={} ntf={} writes={} midi={} updates={} \
              chmaps={} param_result={} peer_identity={} ended={}",
             self.config.name.replace(' ', "_"),
@@ -432,6 +434,7 @@ impl Peripheral {
             r.passkey_waits,
             r.passkey.map_or("-".into(), |v| format!("{v:06}")),
             r.authenticated as u8,
+            r.pauses,
             r.ltk_reuse,
             r.encrypted as u8,
             r.subscribed as u8,

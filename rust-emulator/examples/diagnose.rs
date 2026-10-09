@@ -695,14 +695,16 @@ fn report_ble(cpu: &Cpu) -> Result<(), String> {
     let s = &engine.stats;
     eprintln!(
         "ble_engine_central init_windows={} connect_inds_sent={} master_events={} master_tx_data={} \
-         master_tx_empty={} master_tx_retransmit={} master_rx={}",
+         master_tx_empty={} master_tx_retransmit={} master_rx={} cind_lost={} busy_stops={}",
         s.init_windows,
         s.connect_inds_sent,
         s.master_events,
         s.master_tx_data,
         s.master_tx_empty,
         s.master_tx_retransmit,
-        s.master_rx
+        s.master_rx,
+        s.cind_lost,
+        s.busy_stops
     );
     for p in &engine.peripherals {
         eprintln!("{}", p.report_line());

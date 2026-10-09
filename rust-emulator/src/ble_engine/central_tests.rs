@@ -426,3 +426,74 @@ fn a_first_anchor_after_the_window_is_never_heard() {
         "{r:?}"
     );
 }
+
+#[test]
+fn a_late_event_interrupt_puts_the_unadjusted_first_anchor_after_the_window() {
+    // The FM-1's (blell-dev4): the event interrupt 4.8 ms after the
+    // CONNECT_IND; a firmware that writes 2 x WinOffset + 3 regardless
+    // misses the transmit window, as the hardware did (0x3E).
+    let config = EngineConfig {
+        init_evt_delay_us: 4_800,
+        ..EngineConfig::default()
+    };
+    let mut fw = Fw::initiate(config, keyboard(), params());
+    fw.run(300 * MS);
+    assert!(fw.master);
+    let r = &fw.peripheral().report;
+    assert_eq!(r.first_in_window, None, "{r:?}");
+    assert_eq!(r.established, 0);
+    assert!(
+        r.ended.iter().any(|e| e.starts_with("never established")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn the_engine_reads_busy_for_a_while_after_a_stop() {
+    let config = EngineConfig {
+        busy_after_stop_us: 900,
+        ..EngineConfig::default()
+    };
+    let mut fw = Fw::initiate(config, keyboard(), params());
+    fw.run(5 * MS);
+    assert_eq!(
+        fw.engine.read(0x28038, 4).unwrap() & 2,
+        0,
+        "idle while it runs"
+    );
+    fw.col(14, 0);
+    assert_eq!(fw.engine.read(0x28038, 4).unwrap() & 2, 2, "busy at once");
+    fw.engine.advance(800 * 24, &mut fw.ram).unwrap();
+    assert_eq!(
+        fw.engine.read(0x28038, 4).unwrap() & 2,
+        2,
+        "busy 0.8 ms later"
+    );
+    fw.engine.advance(200 * 24, &mut fw.ram).unwrap();
+    assert_eq!(
+        fw.engine.read(0x28038, 4).unwrap() & 2,
+        0,
+        "idle after 0.9 ms"
+    );
+    assert_eq!(fw.engine.stats.busy_stops, 1);
+}
+
+#[test]
+fn a_lost_connect_ind_leaves_the_peripheral_advertising() {
+    let config = EngineConfig {
+        cind_lost: 1,
+        ..EngineConfig::default()
+    };
+    let mut fw = Fw::initiate(config, keyboard(), params());
+    fw.run(300 * MS);
+    assert_eq!(fw.engine.stats.connect_inds_sent, 1);
+    assert_eq!(fw.engine.stats.cind_lost, 1);
+    let r = &fw.peripheral().report;
+    assert_eq!(r.connections, 0, "{r:?}");
+    assert!(!fw.peripheral().connected());
+    let mut c = EngineConfig::default();
+    c.apply("cind_lost=random,seed=8").unwrap();
+    assert_eq!(c.cind_lost_n(), 2);
+    c.apply("seed=0").unwrap();
+    assert_eq!(c.cind_lost_n(), 1);
+}
