@@ -8,7 +8,6 @@
 // controller initializer at 0x02072326. Packet state and event registers are
 // deliberately excluded; a configuration latch does not simulate a radio.
 const BT_CONFIGURATION: &[u32] = &[
-    0x28000, 0x28008, 0x2800c, 0x28010, 0x28014, 0x28018, 0x28028, 0x2802c, 0x28034, 0x2804c,
     0x20000, 0x2000c, 0x20018, 0x2002c, 0x20058, 0x2005c, 0x2007c, 0x20080, 0x20084, 0x200c0,
     0x200f0, 0x200f4, 0x20120, 0x20124, 0x20128, 0x2012c, 0x20130, 0x20134, 0x20138, 0x20150,
     0x20154, 0x20158, 0x2015c, 0x20160, 0x20164, 0x20168, 0x2fc00, 0x2fc04, 0x2fc08, 0x2fc0c,
@@ -31,9 +30,8 @@ pub(crate) struct Wireless {
     bt_configuration: [u32; BT_CONFIGURATION.len()],
     bt_table: [u32; 128],
     bt_table_position: usize,
-    ble_anchor_data: u32,
-    ble_anchor_result: u32,
-    ble_anchors: [[u32; 64]; 17],
+    /// The BLE baseband engine model (0x28000-0x28054, ble_engine.rs).
+    pub(crate) ble: crate::ble_engine::Engine,
     bt_clock_ticks: u64,
     bt_sample_ticks: u32,
     bt_clock_sample: u32,
@@ -60,9 +58,7 @@ impl Default for Wireless {
             bt_configuration: [0; BT_CONFIGURATION.len()],
             bt_table: [0; 128],
             bt_table_position: 0,
-            ble_anchor_data: 0,
-            ble_anchor_result: 0,
-            ble_anchors: [[0; 64]; 17],
+            ble: Default::default(),
             bt_clock_ticks: 0,
             bt_sample_ticks: 0,
             bt_clock_sample: 0,
@@ -92,7 +88,12 @@ impl Wireless {
     }
     const CLOCK_CONTROL: usize = Self::bt_slot(0x20000);
     const CLOCK_EVENTS: usize = Self::bt_slot(0x2000c);
-    pub(crate) fn advance(&mut self, ticks: u32) {
+    pub(crate) fn advance(&mut self, ticks: u32, ram: &mut [u8]) -> Result<(), &'static str> {
+        self.ble.advance(ticks, ram)?;
+        self.advance_radio(ticks);
+        Ok(())
+    }
+    fn advance_radio(&mut self, ticks: u32) {
         self.filter_ticks = self.filter_ticks.saturating_sub(ticks);
         // Vendor bredr_frame.c uses full 625 us slots and fine microseconds;
         // slot_timer wraps at 27 bits. Functional nominal crystal timing,
@@ -131,6 +132,9 @@ impl Wireless {
         const SLOT: u64 = 15_000;
         const WRAP: u64 = SLOT * (1 << 27);
         let mut next = (self.bt_sample_ticks != 0).then_some(self.bt_sample_ticks as u64);
+        if let Some(ble) = self.ble.ticks_to_event() {
+            next = Some(next.map_or(ble, |n| n.min(ble)));
+        }
         if self.bt_configuration[Self::CLOCK_CONTROL] & 1 != 0 {
             let old = self.bt_clock_ticks;
             let until = |alarm: u32| {
@@ -207,28 +211,8 @@ impl Wireless {
             // transmit execution nor this register's readback is modeled.
             return Some(Err("Bluetooth TX descriptor readback is not implemented"));
         }
-        if address & !3 == 0x28038 {
-            return Some(if size != 4 {
-                Err("wireless registers require word accesses")
-            } else if self.ble_anchors[2]
-                .iter()
-                .any(|control| control & 0x800 != 0)
-            {
-                Err("active BLE packet scheduling is not implemented")
-            } else {
-                // Vendor ble_hw_disable polls bit 1 until the engine is idle.
-                // No enabled anchor means no outstanding packet transaction.
-                Ok(0)
-            });
-        }
-        if matches!(address & !3, 0x2801c | 0x28020 | 0x28024) {
-            return Some(if size != 4 {
-                Err("wireless registers require word accesses")
-            } else if address == 0x28024 {
-                Ok(self.ble_anchor_result)
-            } else {
-                Err("BLE anchor command/data readback is not implemented")
-            });
+        if crate::ble_engine::Engine::owns(address) {
+            return Some(self.ble.read(address & !3, size));
         }
         if let Some(index) = Self::bt_index(address & !3) {
             return Some(if size != 4 {
@@ -333,43 +317,8 @@ impl Wireless {
                 Ok(())
             });
         }
-        if address & !3 == 0x28038 {
-            return Some(if size != 4 {
-                Err("wireless registers require word accesses")
-            } else if matches!(value, 0 | 64) {
-                // Vendor event handler acknowledges bit 7 by writing bit 6.
-                // There are no events in the idle engine.
-                Ok(())
-            } else {
-                Err("unsupported BLE packet status write")
-            });
-        }
-        if matches!(address & !3, 0x2801c | 0x28020 | 0x28024) {
-            if size != 4 {
-                return Some(Err("wireless registers require word accesses"));
-            }
-            match address {
-                0x28020 => self.ble_anchor_data = value,
-                0x2801c => {
-                    // Vendor RF_ble.c: __set/__get_ble_anchor_con issue
-                    // (column << 10) | (HW_ID << 4) | 5/2 respectively.
-                    // Functional configuration storage only. Completion at
-                    // csync, active-radio side effects, field masks and command
-                    // readback still need measurements with an active controller.
-                    let column = (value >> 10) as usize;
-                    let slot = ((value >> 4) & 63) as usize;
-                    if column >= self.ble_anchors.len() || !matches!(value & 15, 2 | 5) {
-                        return Some(Err("unsupported BLE anchor transaction"));
-                    }
-                    if value & 15 == 5 {
-                        self.ble_anchors[column][slot] = self.ble_anchor_data;
-                    } else {
-                        self.ble_anchor_result = self.ble_anchors[column][slot];
-                    }
-                }
-                _ => return Some(Err("BLE anchor result is read-only")),
-            }
-            return Some(Ok(()));
+        if crate::ble_engine::Engine::owns(address) {
+            return Some(self.ble.write(address & !3, value, size));
         }
         if let Some(index) = Self::bt_index(address & !3) {
             if size != 4 {
@@ -389,6 +338,12 @@ impl Wireless {
                 self.bt_table_position += 1;
             }
             self.bt_configuration[index] = value;
+            // The baseband RAM window (fact sheet §2.2, §4 [M:t] H).
+            match address {
+                0x2fc84 => self.ble.set_ram_window(Some(value), None),
+                0x2fcbc => self.ble.set_ram_window(None, Some(value)),
+                _ => {}
+            }
             return Some(Ok(()));
         }
         if (0x11900..=0x1197b).contains(&address) {
@@ -496,7 +451,7 @@ mod clock_tests {
     fn sample(w: &mut Wireless) -> (u32, u32) {
         w.write(0x2001c, 1, 4).unwrap().unwrap();
         assert_eq!(w.read(0x2001c, 4), Some(Ok(1)));
-        w.advance(1);
+        w.advance_radio(1);
         assert_eq!(w.read(0x2001c, 4), Some(Ok(0)));
         (
             w.read(0x20020, 4).unwrap().unwrap(),
@@ -507,12 +462,12 @@ mod clock_tests {
     fn sampled_slot_and_fine_time_are_coherent_and_use_625_microseconds() {
         let mut w = Wireless::default();
         w.write(0x20000, 0x107, 4).unwrap().unwrap();
-        w.advance(14_998);
+        w.advance_radio(14_998);
         assert_eq!(sample(&mut w), (0, 624));
         assert_eq!(sample(&mut w), (1, 0));
-        w.advance(15_000 + 24 * 123 - 1);
+        w.advance_radio(15_000 + 24 * 123 - 1);
         assert_eq!(sample(&mut w), (2, 123));
-        w.advance(30_000);
+        w.advance_radio(30_000);
         assert_eq!(w.read(0x20020, 4), Some(Ok(2)));
         assert_eq!(w.read(0x20024, 4), Some(Ok(123)));
         assert_eq!(sample(&mut w), (4, 123));
@@ -526,9 +481,9 @@ mod clock_tests {
         w.write(0x20000, 0x107, 4).unwrap().unwrap();
         w.write(0x200e4, 3, 4).unwrap().unwrap();
         w.write(0x2000c, 512, 4).unwrap().unwrap();
-        w.advance(44_999);
+        w.advance_radio(44_999);
         assert!(!w.clock_pending_irq());
-        w.advance(1);
+        w.advance_radio(1);
         assert!(w.clock_pending_irq());
         assert_eq!(w.read(0x20010, 4), Some(Ok(512)));
         w.write(0x20018, 1, 4).unwrap().unwrap();
@@ -545,14 +500,14 @@ mod clock_tests {
             w.write(0x2fd44 + i * 4, i + 1, 4).unwrap().unwrap();
         }
         w.write(0x2fd40, 0xff00, 4).unwrap().unwrap();
-        w.advance(1_000);
+        w.advance_radio(1_000);
         assert!(!w.slot_pending_irq());
         w.write(0x2fd40, 255, 4).unwrap().unwrap();
-        w.advance(13_999);
+        w.advance_radio(13_999);
         assert!(!w.slot_pending_irq());
-        w.advance(1);
+        w.advance_radio(1);
         assert_eq!(w.read(0x2fd40, 4), Some(Ok(0x100ff)));
-        w.advance(15_000 * 7);
+        w.advance_radio(15_000 * 7);
         assert_eq!(w.read(0x2fd40, 4), Some(Ok(0xff00ff)));
         w.write(0x2fd40, 0x0100 | 255, 4).unwrap().unwrap();
         assert_eq!(w.read(0x2fd40, 4), Some(Ok(0xfe00ff)));
@@ -573,7 +528,7 @@ mod clock_tests {
         assert_eq!(sample(&mut w), (0, 0));
         assert!(w.slot_pending_irq());
         w.write(0x20000, 0, 4).unwrap().unwrap();
-        w.advance(1_000_000);
+        w.advance_radio(1_000_000);
         assert_eq!(sample(&mut w), (0, 0));
     }
 }
@@ -771,9 +726,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(sample(&mut w), 0x80);
-            w.advance(30 * period - 1);
+            w.advance_radio(30 * period - 1);
             assert_eq!(sample(&mut w), 0x80);
-            w.advance(1);
+            w.advance_radio(1);
             assert_eq!(sample(&mut w), 0xffa0);
         }
         w.write(0x11968, 0, 4).unwrap().unwrap();

@@ -792,7 +792,9 @@ fn stock_ble_anchor_configuration_keeps_columns_and_slots_separate() {
     assert_eq!(c.bus.read(0x28038, 4).unwrap(), 0);
     c.bus.write(0x28020, 0x800, 4).unwrap();
     c.bus.write(0x2801c, 2 << 10 | 5, 4).unwrap();
-    assert!(c.bus.read(0x28038, 4).is_err());
+    // The engine model (ble_engine) finishes radio actions instantly, so
+    // its busy bit reads idle even with a link configured.
+    assert_eq!(c.bus.read(0x28038, 4).unwrap(), 0);
     assert!(c.bus.read(0x28040, 4).is_err());
 }
 

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 pub mod adc;
 pub mod audio;
+pub mod ble_air;
+pub mod ble_central;
+pub mod ble_crypto;
+pub mod ble_engine;
+mod ble_param;
+pub mod ble_peripheral;
 pub mod bus;
 mod cache;
 mod clock;
@@ -13,6 +19,7 @@ pub mod flash_state;
 mod float;
 pub mod gpio;
 pub mod host_thread;
+pub mod isr_profile;
 pub mod lcd;
 pub mod leds;
 mod package;
