@@ -52,6 +52,19 @@ pub(super) struct SlaveLink {
     pending: Option<(Ccm, Ccm, bool)>,
     version_sent: bool,
     terminate: Option<u8>,
+    /// A length exchange happened on the link (either side's request).
+    len_done: bool,
+    /// From the master's LL_ENC_REQ to its LL_START_ENC_RSP: nothing else
+    /// may come from it (Core Vol 6 Part B 5.1.3.1); anything else and this
+    /// peripheral leaves with MIC Failure (0x3D), as NimBLE and Zephyr do
+    /// and as the iPhone did (blell-dev6).
+    enc_start: bool,
+    /// An LL_ENC_REQ answered this many events later (its host's LTK).
+    enc_held: Option<(Vec<u8>, u8)>,
+    /// Our own LL_TERMINATE_IND went out (when): closed once acknowledged,
+    /// or two intervals later (a master that closed at once).
+    term_sent: bool,
+    term_at: Option<u64>,
 }
 
 impl SlaveLink {
@@ -89,6 +102,11 @@ impl SlaveLink {
             pending: None,
             version_sent: false,
             terminate: None,
+            len_done: false,
+            enc_start: false,
+            enc_held: None,
+            term_sent: false,
+            term_at: None,
         })
     }
 
@@ -106,7 +124,9 @@ impl SlaveLink {
 
     /// When the link ends unless the master is heard.
     pub fn deadline(&self) -> u64 {
-        if self.synced {
+        if let Some(t) = self.term_at {
+            t + 2 * self.interval()
+        } else if self.synced {
             self.last_rx + self.params.timeout as u64 * 10 * MS
         } else {
             self.win_start
@@ -118,7 +138,9 @@ impl SlaveLink {
 
     pub fn expired(&self, now: u64) -> Option<String> {
         (now >= self.deadline()).then(|| {
-            if self.synced {
+            if self.term_at.is_some() {
+                "terminated by the peripheral (0x3d MIC failure)".into()
+            } else if self.synced {
                 "supervision timeout".into()
             } else {
                 "never established: no master packet in six windows".into()
@@ -234,6 +256,9 @@ impl SlaveLink {
             return p.clone();
         }
         let mut pdu = self.queue.pop_front().unwrap_or_else(|| vec![1, 0]);
+        if pdu[0] & 3 == 3 && pdu.get(2) == Some(&ll::TERMINATE_IND) {
+            self.term_sent = true;
+        }
         let is_start_enc_req = pdu[0] & 3 == 3 && pdu.get(2) == Some(&START_ENC_REQ);
         let is_pause_rsp = pdu[0] & 3 == 3 && pdu.get(2) == Some(&PAUSE_ENC_RSP);
         if let (Some(c), true) = (self.enc_tx.as_mut(), pdu[1] > 0) {
@@ -288,14 +313,29 @@ impl Peripheral {
         if !link.listen(now, channel, report) {
             return None;
         }
+        let mut enc_due = None;
         if !link.in_event {
             report.events += 1;
+            if let Some((p, n)) = link.enc_held.as_mut() {
+                *n -= 1;
+                if *n == 0 {
+                    enc_due = Some(p.clone());
+                    link.enc_held = None;
+                }
+            }
         }
         link.last_rx = now;
         let (nesn, sn) = ((pdu[0] >> 2) & 1, (pdu[0] >> 3) & 1);
         if nesn != link.sn {
             link.in_flight = None;
             link.sn ^= 1;
+            if link.term_sent {
+                self.close(
+                    now,
+                    "terminated by the peripheral (0x3d MIC failure)".into(),
+                );
+                return None;
+            }
         }
         let mut fresh = None;
         let mut mic_failed = false;
@@ -321,6 +361,26 @@ impl Peripheral {
             self.close(now, "MIC failure".into());
             return None;
         }
+        let link = self.link.as_mut()?;
+        let in_start = |p: &Vec<u8>| {
+            p.first()
+                .is_some_and(|&o| o == START_ENC_RSP || o == ll::TERMINATE_IND)
+        };
+        let breach = match &fresh {
+            Some(Fresh::Control(p)) => link.enc_start && !p.is_empty() && !in_start(p),
+            Some(Fresh::Data(_, p)) => link.enc_start && !p.is_empty(),
+            None => false,
+        };
+        if breach {
+            // (5.1.3.1) another PDU during the encryption start: it leaves.
+            link.enc_start = false;
+            link.enc_held = None;
+            link.send(vec![3, 2, ll::TERMINATE_IND, 0x3D]);
+            self.report.mic_terms += 1;
+            fresh = None;
+        } else if let Some(p) = enc_due {
+            self.enc_answer(&p);
+        }
         match fresh {
             Some(Fresh::Control(p)) if !p.is_empty() => self.on_ll_control(&p),
             Some(Fresh::Data(start, p)) => self.on_l2cap_fragment(now, start, &p),
@@ -329,6 +389,9 @@ impl Peripheral {
         self.host_event(now);
         let link = self.link.as_mut()?;
         let reply = link.next_pdu();
+        if link.term_sent && link.term_at.is_none() {
+            link.term_at = Some(now);
+        }
         let end = now + airtime_ticks(pdu.len() - 2);
         let reply_end = end + T_IFS + airtime_ticks(reply.len() - 2);
         link.in_event = true;
@@ -375,19 +438,23 @@ impl Peripheral {
                 r.extend([0; 7]);
                 link.send(r);
             }
-            ll::LENGTH_REQ => link.send(vec![
-                3,
-                9,
-                ll::LENGTH_RSP,
-                251,
-                0,
-                0x48,
-                0x08,
-                251,
-                0,
-                0x48,
-                0x08,
-            ]),
+            ll::LENGTH_REQ => {
+                link.len_done = true;
+                link.send(vec![
+                    3,
+                    9,
+                    ll::LENGTH_RSP,
+                    251,
+                    0,
+                    0x48,
+                    0x08,
+                    251,
+                    0,
+                    0x48,
+                    0x08,
+                ]);
+            }
+            ll::LENGTH_RSP => link.len_done = true,
             ll::PING_REQ => link.send(vec![3, 1, ll::PING_RSP]),
             ll::CONNECTION_UPDATE_IND if p.len() >= 12 => {
                 let mut n = link.params;
@@ -407,42 +474,29 @@ impl Peripheral {
             }
             ll::TERMINATE_IND => link.terminate = Some(p.get(1).copied().unwrap_or(0)),
             ENC_REQ if p.len() >= 23 => {
-                let mut rand = [0u8; 8];
-                rand.copy_from_slice(&p[1..9]);
-                let ediv = u16_at(9);
-                let mut skdm = [0u8; 8];
-                skdm.copy_from_slice(&p[11..19]);
-                self.enc_request(&rand, ediv);
-                let ltk = self.ltk_for(&rand, ediv);
-                let mut fresh = [0u8; 16];
-                fill(&mut self.rng, &mut fresh);
-                let link = self.link.as_mut().unwrap();
-                let Some((ltk, bonded)) = ltk else {
-                    link.send(vec![3, 2, ll::REJECT_IND, 0x06]);
+                link.enc_start = true;
+                if self.config.auth && !link.len_done {
+                    // The iPhone (blell-dev6): its own LL_LENGTH_REQ when the
+                    // master asked for none before encrypting, its
+                    // LL_ENC_RSP some events later.
+                    link.len_done = true;
+                    link.send(vec![
+                        3,
+                        9,
+                        ll::LENGTH_REQ,
+                        251,
+                        0,
+                        0x48,
+                        0x08,
+                        251,
+                        0,
+                        0x48,
+                        0x08,
+                    ]);
+                    link.enc_held = Some((p.to_vec(), 3));
                     return;
-                };
-                let mut skds = [0u8; 8];
-                skds.copy_from_slice(&fresh[..8]);
-                let mut iv = [0u8; 8];
-                iv[..4].copy_from_slice(&p[19..23]);
-                iv[4..].copy_from_slice(&fresh[8..12]);
-                let key = ble_crypto::session_key(&ltk, &skdm, &skds);
-                let tx = Ccm {
-                    key,
-                    iv,
-                    counter: 0,
-                    direction: 0,
-                };
-                let rx = Ccm {
-                    direction: 1,
-                    ..tx.clone()
-                };
-                link.pending = Some((tx, rx, bonded));
-                let mut r = vec![3, 13, ENC_RSP];
-                r.extend(skds);
-                r.extend(&fresh[8..12]);
-                link.send(r);
-                link.send(vec![3, 1, START_ENC_REQ]);
+                }
+                self.enc_answer(p);
             }
             // The encryption pause (5.1.3.2): ours encrypted, the master's
             // plain, then both directions plain until its LL_ENC_REQ.
@@ -455,6 +509,7 @@ impl Peripheral {
                 self.host.link_auth = false;
             }
             START_ENC_RSP => {
+                link.enc_start = false;
                 if let Some((tx, _, bonded)) = link.pending.take() {
                     link.enc_tx = Some(tx);
                     link.send(vec![3, 1, START_ENC_RSP]);
@@ -469,11 +524,53 @@ impl Peripheral {
             | ll::UNKNOWN_RSP
             | ll::REJECT_IND
             | ll::REJECT_EXT_IND
-            | ll::LENGTH_RSP
             | ll::PING_RSP => {}
             ll::PHY_REQ => link.send(vec![3, 3, PHY_RSP, 1, 1]),
             0x18 => {}
             _ => link.send(vec![3, 2, ll::UNKNOWN_RSP, op]),
         }
+    }
+
+    /// The answer to the master's LL_ENC_REQ `p`: the key by EDIV / Rand
+    /// (the STK, its bond), else Key Missing.
+    fn enc_answer(&mut self, p: &[u8]) {
+        let u16_at = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
+        let mut rand = [0u8; 8];
+        rand.copy_from_slice(&p[1..9]);
+        let ediv = u16_at(9);
+        let mut skdm = [0u8; 8];
+        skdm.copy_from_slice(&p[11..19]);
+        self.enc_request(&rand, ediv);
+        let ltk = self.ltk_for(&rand, ediv);
+        let mut fresh = [0u8; 16];
+        fill(&mut self.rng, &mut fresh);
+        let link = self.link.as_mut().unwrap();
+        let Some((ltk, bonded)) = ltk else {
+            link.enc_start = false;
+            link.send(vec![3, 2, ll::REJECT_IND, 0x06]);
+            return;
+        };
+        let mut skds = [0u8; 8];
+        skds.copy_from_slice(&fresh[..8]);
+        let mut iv = [0u8; 8];
+        iv[..4].copy_from_slice(&p[19..23]);
+        iv[4..].copy_from_slice(&fresh[8..12]);
+        let key = ble_crypto::session_key(&ltk, &skdm, &skds);
+        let tx = Ccm {
+            key,
+            iv,
+            counter: 0,
+            direction: 0,
+        };
+        let rx = Ccm {
+            direction: 1,
+            ..tx.clone()
+        };
+        link.pending = Some((tx, rx, bonded));
+        let mut r = vec![3, 13, ENC_RSP];
+        r.extend(skds);
+        r.extend(&fresh[8..12]);
+        link.send(r);
+        link.send(vec![3, 1, START_ENC_REQ]);
     }
 }

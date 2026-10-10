@@ -552,6 +552,27 @@ fn an_auth_peripheral_needs_the_passkey() {
     m.encrypt(&bond.0, bond.1, &bond.2);
     assert!(m.p.report.authenticated && m.p.report.ltk_reuse == 1);
     assert_eq!(cccd_write(&mut m), [0x13]);
+    // The iPhone (blell-dev6): no length exchange before the LL_ENC_REQ ->
+    // its own LL_LENGTH_REQ; answered during the encryption start -> it
+    // leaves with MIC Failure (0x3D).
+    let mut m = Master::connect(cfg.clone(), 100);
+    let mut req = vec![0x03];
+    req.extend(bond.2);
+    req.extend(bond.1.to_le_bytes());
+    req.extend([0u8; 12]);
+    m.ll_send(&req);
+    m.ll_reply(0x14);
+    m.ll_send(&[0x15, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    assert_eq!(m.ll_reply(0x02), [0x02, 0x3D]);
+    m.events(2);
+    assert!(m.p.report.mic_terms == 1 && !m.p.report.encrypted && m.p.link.is_none());
+    // The length first: no LL_LENGTH_REQ of its own, encrypted.
+    let mut m = Master::connect(cfg.clone(), 100);
+    m.ll_send(&[0x14, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08]);
+    m.ll_reply(0x15);
+    m.encrypt(&bond.0, bond.1, &bond.2);
+    assert!(m.p.report.authenticated && m.p.report.mic_terms == 0);
+    assert!(m.ll.iter().all(|p| p[0] != 0x14));
     let mut m = Master::connect(cfg.clone(), 100);
     m.encrypt(&jw_keys.0, jw_keys.1, &jw_keys.2);
     assert!(m.p.report.encrypted && !m.p.report.authenticated);

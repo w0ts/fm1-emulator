@@ -217,6 +217,9 @@ pub struct Report {
     pub authenticated: bool,
     /// Encryptions started with the bond's LTK (EDIV / Rand), not an STK.
     pub ltk_reuse: u32,
+    /// Links it left with MIC Failure (0x3D): another PDU from the master
+    /// while its encryption was starting (Core Vol 6 Part B 5.1.3.1).
+    pub mic_terms: u32,
     /// Encryption pauses the master started (a new key on the link).
     pub pauses: u32,
     pub encrypted: bool,
@@ -409,7 +412,7 @@ impl Peripheral {
             "ble_peripheral name={} addr={} identity={} adv={} scan_reqs={} conns={} established={} \
              in_window={window} offset_us={} first_event={} events={} ll={} mtu={} auth_errors={} \
              paired={} auth_pairings={} late_fails={} passkey_waits={} passkey={} authenticated={} pauses={} \
-             ltk_reuse={} encrypted={} subscribed={} ntf={} writes={} midi={} updates={} \
+             ltk_reuse={} mic_terms={} encrypted={} subscribed={} ntf={} writes={} midi={} updates={} \
              chmaps={} param_result={} peer_identity={} ended={}",
             self.config.name.replace(' ', "_"),
             hex(&self.address),
@@ -436,6 +439,7 @@ impl Peripheral {
             r.authenticated as u8,
             r.pauses,
             r.ltk_reuse,
+            r.mic_terms,
             r.encrypted as u8,
             r.subscribed as u8,
             r.notifications,
