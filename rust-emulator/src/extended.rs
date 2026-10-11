@@ -490,14 +490,17 @@ pub(crate) fn execute(
                     }
                     let dividend = cpu.r[s] as u64 | ((cpu.r[s + 1] as u64) << 32);
                     let d = d & 14;
+                    // Measured on an FM-1 (upstream 1875a54): a zero divisor
+                    // gives 0 in both forms (when the trap is off), signed
+                    // division truncates toward zero and INT64_MIN / -1 wraps.
                     let quotient = if x & 0x1000 == 0 {
-                        dividend.checked_div(cpu.r[c] as u64)
+                        dividend.checked_div(cpu.r[c] as u64).unwrap_or(0)
                     } else {
                         (dividend as i64)
                             .checked_div(cpu.r[c] as i32 as i64)
-                            .map(|n| n as u64)
-                    }
-                    .ok_or_else(|| Box::new(Fault::Unsupported { pc, word: h as u16 }))?;
+                            .unwrap_or(if cpu.r[c] == 0 { 0 } else { dividend as i64 })
+                            as u64
+                    };
                     cpu.r[d] = quotient as u32;
                     cpu.r[d + 1] = (quotient >> 32) as u32;
                     op = "divide_wide";
