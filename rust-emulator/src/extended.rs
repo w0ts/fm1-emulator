@@ -472,7 +472,12 @@ pub(crate) fn execute(
                     let pair = d & 14;
                     let result = if h == 0xe1fc {
                         let accumulator = cpu.r[pair] as u64 | ((cpu.r[pair + 1] as u64) << 32);
-                        accumulator.wrapping_add(product)
+                        // Measured on an FM-1 (upstream 1875a54), signed and
+                        // unsigned: only C changes, to the carry out of the
+                        // 64-bit addition; V, Z and N stay.
+                        let (sum, carry) = accumulator.overflowing_add(product);
+                        cpu.sr[5] = (cpu.sr[5] & !2) | (carry as u32) << 1;
+                        sum
                     } else {
                         product
                     };
