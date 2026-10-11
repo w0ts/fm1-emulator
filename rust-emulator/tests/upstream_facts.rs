@@ -230,3 +230,13 @@ fn multiply_accumulate_leads_a_parallel_pair_with_a_load() {
     assert_eq!(c.r[6], 0xbeef);
     assert_eq!(pair(&c, 14) as i64, 79);
 }
+
+#[test]
+fn presets_and_algorithm_encoders_sit_on_the_contacts_stock_firmware_reads() {
+    // Stock firmware steps the preset number on the encoder at columns 0/1,
+    // row 5 and opens the algorithm overlay on columns 2/3, row 0
+    // (upstream 62536b2 swapped its transcription to this).
+    use fm1_emu::encoders::{knob, CONTACTS};
+    assert_eq!(CONTACTS[knob::PRESETS], [0, 5, 1, 5]);
+    assert_eq!(CONTACTS[knob::ALGORITHM], [2, 0, 3, 0]);
+}
