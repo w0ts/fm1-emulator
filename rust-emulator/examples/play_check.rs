@@ -113,6 +113,37 @@ const BUTTONS: [&str; 14] = [
     "REC",
 ];
 
+/// Run `seconds` in the UI's 20 ms LED windows and print, per lit key, the
+/// range of the raw window level and of the filtered level (what fm1-ui
+/// shows), after the filter's first 100 ms.
+fn print_levels(player: &mut Player, seconds: f64) -> Result<(), String> {
+    let mut filter = leds::LevelFilter::default();
+    let mut range: Vec<Option<[f32; 4]>> = vec![None; leds::KEYS];
+    let windows = (seconds / 0.02).round() as usize;
+    for window in 0..windows {
+        player.run_seconds(0.02)?;
+        let leds = &mut player.cpu.bus.devices.gpio.leds;
+        let ticks = leds.window();
+        let sums = leds.take_sums();
+        let level = leds::by_key(&filter.push(&sums, ticks));
+        let raw = leds::by_key(&sums.brightness());
+        if window < 5 {
+            continue;
+        }
+        for (id, slot) in range.iter_mut().enumerate() {
+            let [lo, hi, flo, fhi] = slot.unwrap_or([f32::MAX, 0., f32::MAX, 0.]);
+            *slot = Some([lo.min(raw[id]), hi.max(raw[id]), flo.min(level[id]), fhi.max(level[id])]);
+        }
+    }
+    for (id, slot) in range.iter().enumerate() {
+        if let Some([lo, hi, flo, fhi]) = slot.filter(|r| r[1] > 0.) {
+            let name = BUTTONS.get(id).map_or(format!("key{}", id.wrapping_sub(14)), |n| n.to_string());
+            println!("  {name:6} raw {lo:.3}..{hi:.3} (spread {:.3})  filtered {flo:.3}..{fhi:.3} (spread {:.3})", hi - lo, fhi - flo);
+        }
+    }
+    Ok(())
+}
+
 /// The LED brightness array (`[column][line]`, line = row bit PA5..PA8),
 /// then the lit LEDs by key.
 fn print_leds(brightness: &leds::Brightness) {
@@ -447,6 +478,10 @@ fn play(player: &mut Player, firmware: &str, steps: &[String]) -> Result<(), Str
                 player.run_seconds(seconds(step, s)?)?;
                 print_leds(&player.cpu.bus.devices.gpio.leds.take());
                 Ok(())
+            }
+            ["levels", s] => {
+                player.cpu.bus.devices.gpio.leds.take();
+                print_levels(player, seconds(step, s)?)
             }
             _ => return Err(format!("unknown step {step}")),
         };

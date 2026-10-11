@@ -4,9 +4,11 @@
 use eframe::egui::{self, Color32, Rect, Stroke, StrokeKind};
 use fm1_emu::leds::KEYS;
 
-/// Guest time a brightness sample spans at least (oscillator ticks, 20 ms):
-/// whole dim cycles average out, so a slow guest does not flicker, while
-/// blinking (a few Hz) still shows.
+/// Guest time a brightness sample spans at least (oscillator ticks, 20 ms).
+/// The samples go through `fm1_emu::leds::LevelFilter` (80 ms average, steps
+/// followed at once): a few whole dim cycles do not add up in so short a
+/// window, and the filter averages the rest, so a dimmed LED reads steady
+/// while blinking (a few Hz) still shows.
 pub(super) const WINDOW_TICKS: u64 = 480_000;
 /// Below this duty an LED reads as dark.
 const DARK: f32 = 0.001;

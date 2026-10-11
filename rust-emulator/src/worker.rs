@@ -98,6 +98,7 @@ pub(super) struct Machine {
     web: Option<(Arc<Hub>, Decoder)>,
     generation: u64,
     last_lcd: Option<(u64, bool)>,
+    led_filter: fm1_emu::leds::LevelFilter,
     state: Option<StateConfig>,
     persistence: Option<Persistence>,
     state_message: Option<String>,
@@ -118,6 +119,7 @@ impl Machine {
             web: None,
             generation: 0,
             last_lcd: None,
+            led_filter: Default::default(),
             state: None,
             persistence: None,
             state_message: None,
@@ -195,6 +197,7 @@ impl Machine {
                 self.generation = generation;
                 self.paused = false;
                 self.last_lcd = None;
+                self.led_filter.reset();
                 self.encoders = Encoders::default();
                 if let Some(audio) = &self.audio {
                     audio.clear();
@@ -319,7 +322,9 @@ impl Machine {
         if let Some(cpu) = &mut self.cpu {
             let leds = &mut cpu.bus.devices.gpio.leds;
             if leds.window() >= super::ui_leds::WINDOW_TICKS {
-                snapshot.leds = Some(fm1_emu::leds::by_key(&leds.take()));
+                let ticks = leds.window();
+                let level = self.led_filter.push(&leds.take_sums(), ticks);
+                snapshot.leds = Some(fm1_emu::leds::by_key(&level));
             }
         }
         if let Some(cpu) = &self.cpu {
