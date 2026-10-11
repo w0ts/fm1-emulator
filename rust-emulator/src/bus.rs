@@ -67,7 +67,8 @@ mod dma_tests {
         b.write(0x12108, 383, 2).unwrap();
         b.write(0x12114, RAM, 4).unwrap();
         b.write(0x12118, 3, 2).unwrap();
-        b.advance_devices(23039);
+        // Measured: three bytes take 3 * (41 * 384 + 6) PLL48M clocks.
+        b.advance_devices(23624);
         assert_eq!(b.pending_irq(0x100), None);
         b.advance_devices(1);
         assert_eq!(b.pending_irq(0x100), Some(20));
@@ -76,7 +77,7 @@ mod dma_tests {
         assert_eq!(b.pending_irq(0x100), None);
         b.write(0x10010, 0, 4).unwrap(); // OSC24M halves the baud rate.
         b.write(0x12118, 3, 2).unwrap();
-        b.advance_devices(46079);
+        b.advance_devices(47249);
         assert_eq!(b.pending_irq(0x100), None);
         b.advance_devices(1);
         assert_eq!(b.pending_irq(0x100), Some(20));
