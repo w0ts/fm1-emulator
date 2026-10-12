@@ -139,7 +139,7 @@ pub(crate) enum Wide {
     WordPostincrementLoad,
     RegisterPostincrement,
     PairPostincrement,
-    PairRegisterPreincrement,
+    PairRegisterSum,
     PushSpecialMask,
     PopSpecialMask,
     Trigger,
@@ -467,12 +467,14 @@ fn wide(h: u32, x: u32) -> Wide {
     if h == 0xe190 && x & 15 <= 3 {
         return Wide::LogicThree;
     }
-    if h & 0xffe0 == 0xeb20 && x != 0 {
-        // [rN+] = {...} (eb2X) and [rN++] = {...} (eb3X).
-        return Wide::StoreRegisterList;
-    }
-    if h & 0xffe0 == 0xeb00 && x != 0 {
-        return Wide::LoadRegisterList;
+    if h & 0xff80 == 0xeb00 && x != 0 {
+        // Multiple-register access, bit 5 of h selecting the store; see
+        // extended::register_list for the direction and writeback bits.
+        return if h & 0x20 != 0 {
+            Wide::StoreRegisterList
+        } else {
+            Wide::LoadRegisterList
+        };
     }
     if matches!(h, 0xe9d8 | 0xe9d9 | 0xe9dc | 0xe9dd | 0xe9de) {
         return Wide::StackSubword;
@@ -486,8 +488,10 @@ fn wide(h: u32, x: u32) -> Wide {
     if h & 0xfff8 == 0xec58 && x & 2 == 0 {
         return Wide::PairPostincrement;
     }
-    if h == 0xec5c && x & 2 != 0 {
-        return Wide::PairRegisterPreincrement;
+    if h & 0xfff8 == 0xec58 && x & 2 != 0 && x & 4 == 0 && !(x & 8 != 0 && h & 4 != 0) {
+        // Register sum: scaled by eight when x bit 3 is set, written back
+        // when the opcode's bit 2 is (which excludes the scaled form).
+        return Wide::PairRegisterSum;
     }
     if matches!(h & 0xfff0, 0xe1a0 | 0xe1b0) {
         return Wide::BitField;

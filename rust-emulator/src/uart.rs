@@ -47,9 +47,9 @@ mod tests {
         uart.write(0x12108, 383, 2, None).unwrap().unwrap();
         uart.write(0x12114, crate::RAM, 4, None).unwrap().unwrap();
         uart.write(0x12118, 3, 2, Some(&ram)).unwrap().unwrap();
-        // PLL48M / (4 * (383 + 1)) = 31250 baud; three 8N1
-        // frames require 960us, or 23040 oscillator ticks.
-        uart.advance(23039, 48_000_000);
+        // PLL48M / (4 * (383 + 1)) = 31250 baud; three bytes measured on an
+        // FM-1 take 3 * (41 * 384 + 6) = 47250 PLL clocks, 23625 oscillator ticks.
+        uart.advance(23624, 48_000_000);
         assert!(!uart.pending_irq());
         assert!(uart.transmitted.is_empty());
         uart.advance(1, 48_000_000);
@@ -210,7 +210,7 @@ impl Uart {
                     self.registers[index] = value & 65535;
                     Ok(())
                 }
-                3 => self.start(&[value as u8]),
+                3 => self.start(&[value as u8], false),
                 6 => {
                     let count = (value & 65535) as usize;
                     if count == 0 {
@@ -221,7 +221,7 @@ impl Uart {
                             ram.get(offset..offset.checked_add(count)?)
                         });
                         match bytes {
-                            Some(bytes) => self.start(bytes),
+                            Some(bytes) => self.start(bytes, true),
                             None => Err("UART transmit DMA source is outside SRAM"),
                         }
                     }
@@ -291,7 +291,7 @@ impl Uart {
         self.rx_pending = true;
     }
 
-    fn start(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+    fn start(&mut self, bytes: &[u8], dma: bool) -> Result<(), &'static str> {
         if self.registers[0] & 3 != 1 || self.registers[1] != 0 {
             return Err("UART transmit requires enabled 8N1 configuration");
         }
@@ -299,8 +299,18 @@ impl Uart {
             return Err("UART transmit already in progress");
         }
         let divider = if self.registers[0] & 16 == 0 { 4 } else { 3 };
-        self.remaining =
-            bytes.len() as u64 * 10 * divider * (self.registers[2] as u64 + 1) * 24_000_000;
+        let baud = self.registers[2] as u64 + 1;
+        // A DMA byte takes 10 + 1/divider bit times, plus six clocks, not the
+        // nominal ten bit times: measured on an FM-1
+        // with TIMER4 over 1, 3 and 8 bytes, BAUD 95 to 767, both dividers
+        // (upstream 98d08b5: 7881, 23628 and 63004 oscillator ticks for BAUD
+        // 383 and divider 4, where the nominal frame would take 7680 per byte).
+        let clocks_per_byte = if dma {
+            (10 * divider + 1) * baud + 6
+        } else {
+            10 * divider * baud
+        };
+        self.remaining = bytes.len() as u64 * clocks_per_byte * 24_000_000;
         self.transmit.extend_from_slice(bytes);
         self.pending = false;
         Ok(())

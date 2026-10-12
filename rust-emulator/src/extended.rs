@@ -69,6 +69,42 @@ fn float_condition(kind: u32, lhs: f32, rhs: f32) -> bool {
     }
 }
 
+/// Multiple-register load or store over the bitmap `x`, the lowest register at
+/// the lowest address (EB00-EB7F, base register h & 15). h bit 4 charges the
+/// register count to the base ("++" and "--"), bit 6 puts the block below the
+/// base ("-"). Measured on an FM-1 (upstream 8789037): every word is addressed
+/// from the incoming base, a store captures the incoming register file and
+/// writes the base back afterwards, and a load writes the base back first so
+/// a masked base keeps its loaded value.
+fn register_list(cpu: &mut Cpu, h: u32, x: u32, store: bool) -> Step<()> {
+    let base = (h & 15) as usize;
+    let span = x.count_ones().wrapping_mul(4);
+    let incoming = cpu.r[base];
+    let start = if h & 0x40 != 0 {
+        incoming.wrapping_sub(span)
+    } else {
+        incoming
+    };
+    let end = if h & 0x40 != 0 { start } else { incoming.wrapping_add(span) };
+    let writeback = h & 0x10 != 0;
+    if writeback && !store {
+        cpu.r[base] = end;
+    }
+    let mut address = start;
+    for register in (0..16).filter(|register| x & (1 << register) != 0) {
+        if store {
+            cpu.write(address, cpu.r[register])?;
+        } else {
+            cpu.r[register] = cpu.read(address, 4)?;
+        }
+        address = address.wrapping_add(4);
+    }
+    if writeback && store {
+        cpu.r[base] = end;
+    }
+    Ok(())
+}
+
 pub(crate) fn execute(
     cpu: &mut Cpu,
     h: u32,
@@ -472,7 +508,12 @@ pub(crate) fn execute(
                     let pair = d & 14;
                     let result = if h == 0xe1fc {
                         let accumulator = cpu.r[pair] as u64 | ((cpu.r[pair + 1] as u64) << 32);
-                        accumulator.wrapping_add(product)
+                        // Measured on an FM-1 (upstream 1875a54), signed and
+                        // unsigned: only C changes, to the carry out of the
+                        // 64-bit addition; V, Z and N stay.
+                        let (sum, carry) = accumulator.overflowing_add(product);
+                        cpu.sr[5] = (cpu.sr[5] & !2) | (carry as u32) << 1;
+                        sum
                     } else {
                         product
                     };
@@ -490,14 +531,17 @@ pub(crate) fn execute(
                     }
                     let dividend = cpu.r[s] as u64 | ((cpu.r[s + 1] as u64) << 32);
                     let d = d & 14;
+                    // Measured on an FM-1 (upstream 1875a54): a zero divisor
+                    // gives 0 in both forms (when the trap is off), signed
+                    // division truncates toward zero and INT64_MIN / -1 wraps.
                     let quotient = if x & 0x1000 == 0 {
-                        dividend.checked_div(cpu.r[c] as u64)
+                        dividend.checked_div(cpu.r[c] as u64).unwrap_or(0)
                     } else {
                         (dividend as i64)
                             .checked_div(cpu.r[c] as i32 as i64)
-                            .map(|n| n as u64)
-                    }
-                    .ok_or_else(|| Box::new(Fault::Unsupported { pc, word: h as u16 }))?;
+                            .unwrap_or(if cpu.r[c] == 0 { 0 } else { dividend as i64 })
+                            as u64
+                    };
                     cpu.r[d] = quotient as u32;
                     cpu.r[d + 1] = (quotient >> 32) as u32;
                     op = "divide_wide";
@@ -731,31 +775,11 @@ pub(crate) fn execute(
                     op = "logic_three";
                 }
                 Wide::StoreRegisterList => {
-                    let mut address = cpu.r[n];
-                    for register in 0..16 {
-                        if x & (1 << register) != 0 {
-                            cpu.write(address, cpu.r[register])?;
-                            address = address.wrapping_add(4);
-                        }
-                    }
-                    // [rN++] = {...} (EB3X): the base advances past the list.
-                    if h & 0x10 != 0 {
-                        cpu.r[n] = address;
-                    }
+                    register_list(cpu, h, x, true)?;
                     op = "store_register_list";
                 }
                 Wide::LoadRegisterList => {
-                    let mut address = cpu.r[n];
-                    for register in 0..16 {
-                        if x & (1 << register) != 0 {
-                            cpu.r[register] = cpu.read(address, 4)?;
-                            address = address.wrapping_add(4);
-                        }
-                    }
-                    // {...} = [rN++] (EB1X), as the store.
-                    if h & 0x10 != 0 {
-                        cpu.r[n] = address;
-                    }
+                    register_list(cpu, h, x, false)?;
                     op = "load_register_list";
                 }
                 Wide::StackSubword => {
@@ -803,12 +827,18 @@ pub(crate) fn execute(
                     cpu.r[s] = addr.wrapping_add(offset as u32);
                     op = "pair_postincrement";
                 }
-                Wide::PairRegisterPreincrement => {
-                    // EC5C with x bit 1: r9_r8 = d[++r1=r0] (stock 0x0200940e).
-                    let addr = cpu.r[s].wrapping_add(cpu.r[c]);
+                Wide::PairRegisterSum => {
+                    // EC58-EC5F with x bit 1: d[rS+rC] (kind bit 3 scales rC
+                    // by eight), written back to rS first when the opcode's
+                    // bit 2 is set (vendor objdump: EC58 0233 is
+                    // d[r3+r2] = r1_r0, EC5C 8012 is r9_r8 = d[++r1=r0]).
+                    let index = cpu.r[c] << if x & 8 != 0 { 3 } else { 0 };
+                    let addr = cpu.r[s].wrapping_add(index);
                     pair_access(cpu, addr, d, x & 1 != 0)?;
-                    cpu.r[s] = addr;
-                    op = "pair_register_preincrement";
+                    if h & 4 != 0 {
+                        cpu.r[s] = addr;
+                    }
+                    op = "pair_register_sum";
                 }
                 Wide::BitField => {
                     let pos = (x >> 7) & 31;

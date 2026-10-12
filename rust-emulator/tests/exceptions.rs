@@ -79,10 +79,17 @@ fn integer_divides_by_zero_trap_when_armed_and_fault_otherwise() {
         c.r[4] = 99;
         c.step().unwrap();
         assert_trapped(&c, XIP);
-        assert!(
-            cpu(&words).step().is_err(),
-            "unarmed: the quotient is unmeasured"
-        );
+        let mut unarmed = cpu(&words);
+        unarmed.r[2] = 1234;
+        unarmed.r[4] = 99;
+        if words[0] == 0xe1f6 {
+            // Measured on an FM-1 (upstream 1875a54): the 64-bit divide of
+            // zero gives 0.
+            unarmed.step().unwrap();
+            assert_eq!((unarmed.r[0], unarmed.r[1]), (0, 0));
+        } else {
+            assert!(unarmed.step().is_err(), "unarmed: the quotient is unmeasured");
+        }
     }
 }
 
