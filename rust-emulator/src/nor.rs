@@ -17,6 +17,8 @@ pub struct Nor {
     write_enabled: bool,
     busy_ticks: u32,
     pending: Option<Pending>,
+    /// A suspended sector erase: its remaining busy ticks.
+    suspended: Option<u32>,
     /// Counts completed programs and erases (flash contents changed).
     generation: u64,
     /// Completed programs and erases only (not package loads or restores).
@@ -51,6 +53,7 @@ impl Default for Nor {
             write_enabled: false,
             busy_ticks: 0,
             pending: None,
+            suspended: None,
             generation: 0,
             writes: 0,
             tracked: vec![false; 1024 * 1024 / SECTOR],
@@ -209,7 +212,7 @@ impl Nor {
     }
     pub fn chip_select(&mut self, selected: bool) {
         if self.selected != selected {
-            if !selected && self.busy_ticks == 0 {
+            if !selected && !self.suspend_or_resume() && self.busy_ticks == 0 {
                 self.finish_command();
             }
             self.command.clear();
@@ -218,10 +221,43 @@ impl Nor {
         self.selected = selected;
     }
 
+    /// P25Q80H datasheet sections 10.36 and 10.38: erase suspend (75h or B0h)
+    /// stops a sector erase (WIP 0, WEL 0, SUS1 1; the array reads again) and
+    /// resume (7Ah or 30h) continues it (WIP 1, WEL 1, SUS1 0). Modelled
+    /// without the suspend latency (tESL, 30 us max). A suspend of a page
+    /// program, and a program while an erase is suspended, are not modelled:
+    /// ignored. Returns whether the command was one of the four.
+    fn suspend_or_resume(&mut self) -> bool {
+        match self.command.as_slice() {
+            [0x75] | [0xb0] => {
+                if self.suspended.is_none()
+                    && self.busy_ticks != 0
+                    && matches!(self.pending, Some(Pending::Erase(_)))
+                {
+                    self.suspended = Some(self.busy_ticks);
+                    self.busy_ticks = 0;
+                    self.write_enabled = false;
+                }
+                true
+            }
+            [0x7a] | [0x30] => {
+                if let Some(remaining) = self.suspended.take() {
+                    self.busy_ticks = remaining;
+                    self.write_enabled = true;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn finish_command(&mut self) {
         // P25Q80H datasheet sections 10.2, 10.3, 10.20 and 10.24:
         // commands latch on CS rising; writes require WEL. Typical times are
         // 2 ms program and 8 ms sector erase, on the 24 MHz oscillator clock.
+        if self.suspended.is_some() && matches!(self.command.first(), Some(0x02 | 0x20)) {
+            return; // (no new program or erase while an erase is suspended)
+        }
         match self.command.as_slice() {
             [0x06] => self.write_enabled = true,
             [0x04] => self.write_enabled = false,
@@ -241,12 +277,14 @@ impl Nor {
 
     /// Oscillator ticks until a program or erase in progress completes.
     pub(crate) fn ticks_to_event(&self) -> Option<u64> {
-        self.pending
-            .is_some()
+        (self.pending.is_some() && self.suspended.is_none())
             .then(|| (self.busy_ticks as u64).max(1))
     }
 
     pub(crate) fn advance(&mut self, ticks: u32) {
+        if self.suspended.is_some() {
+            return; // (a suspended erase does not progress)
+        }
         self.busy_ticks = self.busy_ticks.saturating_sub(ticks);
         if self.busy_ticks != 0 {
             return;
@@ -309,8 +347,8 @@ impl Nor {
                     }
                 }
                 0x05 => value = ((self.write_enabled as u32) << 1) | (self.busy_ticks != 0) as u32,
-                0x35 => value = 0,
-                0x06 | 0x04 | 0x02 | 0x20 => {}
+                0x35 => value = (self.suspended.is_some() as u32) << 2, // SUS1 (S10)
+                0x06 | 0x04 | 0x02 | 0x20 | 0x75 | 0xb0 | 0x7a | 0x30 => {}
                 0x03 | 0x0b | 0x6b => {
                     let start = if self.command[0] == 3 { 4 } else { 5 };
                     if len == 4 {
@@ -417,6 +455,36 @@ mod tests {
         );
         nor.write(0x40300, 0).unwrap().unwrap();
         assert_eq!(nor.xip(0x0208d000, 4).unwrap().unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn an_erase_suspends_reads_and_resumes_where_it_stopped() {
+        let mut nor = Nor::default();
+        nor.bytes[0x91000] = 0x55;
+        transaction(&mut nor, &[0x75]); // idle: ignored
+        transaction(&mut nor, &[0x7a]);
+        assert_eq!(transaction(&mut nor, &[5, 255]), 0);
+        transaction(&mut nor, &[6]);
+        transaction(&mut nor, &[0x20, 9, 0x10, 0]);
+        nor.advance(100_000);
+        transaction(&mut nor, &[0x75]);
+        assert_eq!(transaction(&mut nor, &[5, 255]), 0); // WIP 0, WEL 0
+        assert_eq!(transaction(&mut nor, &[0x35, 255]), 4); // SUS1
+        assert_eq!(nor.ticks_to_event(), None);
+        nor.advance(1_000_000); // suspended: no progress
+        assert_eq!(nor.bytes[0x91000], 0x55);
+        assert_eq!(transaction(&mut nor, &[3, 9, 0x10, 0, 255]), 0x55); // reads
+        transaction(&mut nor, &[6]);
+        transaction(&mut nor, &[0x20, 9, 0x20, 0]); // refused while suspended
+        transaction(&mut nor, &[0x7a]);
+        assert_eq!(transaction(&mut nor, &[5, 255]), 3);
+        assert_eq!(transaction(&mut nor, &[0x35, 255]), 0);
+        nor.advance(91_999);
+        assert_eq!(transaction(&mut nor, &[5, 255]) & 1, 1);
+        nor.advance(1);
+        assert_eq!(transaction(&mut nor, &[5, 255]), 0);
+        assert_eq!(nor.bytes[0x91000], 255);
+        assert_eq!(nor.writes(), 1);
     }
 
     #[test]
