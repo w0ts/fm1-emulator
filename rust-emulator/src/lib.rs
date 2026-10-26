@@ -27,6 +27,7 @@ mod perf;
 pub mod player;
 pub mod png;
 pub mod profile;
+pub mod sd;
 mod shift_spi;
 mod simd;
 mod spin;

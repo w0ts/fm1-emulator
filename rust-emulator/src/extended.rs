@@ -571,6 +571,13 @@ pub(crate) fn execute(
                     cpu.r[d + 1] = (result >> 32) as u32;
                     op = "shift_wide_immediate";
                 }
+                Wide::RotateWideImmediate => {
+                    let value = cpu.r[d] as u64 | ((cpu.r[d + 1] as u64) << 32);
+                    let result = value.rotate_right(((x >> 8) & 3) * 16 + (x & 15));
+                    cpu.r[d] = result as u32;
+                    cpu.r[d + 1] = (result >> 32) as u32;
+                    op = "rotate_wide_immediate";
+                }
                 Wide::Divide => {
                     if cpu.r[c] == 0 && cpu.divide_by_zero(pc)? {
                         return Ok(Some((pc + 4, "divide")));

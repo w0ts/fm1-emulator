@@ -1173,9 +1173,11 @@ struct Args {
     /// `--app-data`: keep the settings and flash state in the per-user
     /// application-data folder, as an installed app does.
     app_data: bool,
+    /// `--sd IMAGE`: an SD card on the LCD's bus holding that raw image (sd.rs; FM1_SD too).
+    sd: Option<PathBuf>,
 }
 const USAGE: &str =
-    "usage: emulator [--cpu-mhz N] [--ui DIR] [--theme NAME] [--state PATH] [--fresh] [--app-data] [firmware]";
+    "usage: emulator [--cpu-mhz N] [--ui DIR] [--theme NAME] [--state PATH] [--fresh] [--app-data] [--sd IMAGE] [firmware]";
 /// The theme called `name`, or an error listing them.
 fn theme_named(name: &str) -> Result<usize, String> {
     ui_theme::find(name)
@@ -1190,6 +1192,7 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
     let mut state = None;
     let mut fresh = false;
     let mut app_data = false;
+    let mut sd = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--state" {
@@ -1198,6 +1201,8 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
             ));
         } else if arg == "--fresh" {
             fresh = true;
+        } else if arg == "--sd" {
+            sd = Some(PathBuf::from(args.next().ok_or("--sd needs a card image")?));
         } else if arg == "--app-data" {
             app_data = true;
         } else if arg == "--ui" {
@@ -1229,6 +1234,7 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
         state,
         fresh,
         app_data,
+        sd,
     })
 }
 fn main() -> eframe::Result {
@@ -1243,6 +1249,9 @@ fn main() -> eframe::Result {
     }
     let bare = std::env::args_os().len() == 1;
     let args = parse_args(std::env::args_os().skip(1)).unwrap_or_else(|error| fail(error));
+    if let Some(image) = args.sd.clone() {
+        let _ = fm1_emu::sd::IMAGE.set(image);
+    }
     let theme = match (args.theme, std::env::var("FM1_THEME")) {
         (Some(theme), _) => Some(theme),
         (None, Ok(name)) => Some(theme_named(&name).unwrap_or_else(|error| fail(error))),
@@ -1727,8 +1736,11 @@ mod tests {
             state: None,
             fresh: false,
             app_data: false,
+            sd: None,
         };
         assert_eq!(parse(&["a.fwsc"]), Ok(args(None, None)));
+        assert_eq!(parse(&["--sd", "card.img", "a.fwsc"]).unwrap().sd, Some(PathBuf::from("card.img")));
+        assert!(parse(&["a.fwsc", "--sd"]).is_err());
         assert_eq!(
             parse(&["--cpu-mhz", "24", "a.fwsc"]),
             Ok(args(Some(24), None))

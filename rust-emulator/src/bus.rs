@@ -135,6 +135,8 @@ pub struct Bus {
     pub flash: Vec<u8>,
     pub devices: Devices,
     pub lcd: Lcd,
+    /// An SD card on the LCD's SPI1 (sd.rs: --sd / FM1_SD), none by default.
+    pub sd: Option<crate::sd::SdCard>,
     pub system: crate::system::System,
     ram: Vec<u8>,
     guards: crate::guards::Guards,
@@ -312,6 +314,9 @@ impl Bus {
             flash,
             devices: Devices::default(),
             lcd: Lcd::default(),
+            sd: crate::sd::image_path()
+                .map(|p| crate::sd::SdCard::open(&p))
+                .transpose()?,
             system: Default::default(),
             ram: vec![0; RAM_SIZE],
             guards: Default::default(),
@@ -879,6 +884,9 @@ impl Bus {
                     "SPI registers require word accesses",
                 ));
             }
+            if self.sd_transfer(address, value)? {
+                return Ok(());
+            }
             let bytes = if address == SPI + 16 {
                 let source = self.lcd.dma_address();
                 let length = value as usize;
@@ -929,6 +937,40 @@ impl Bus {
         })?;
         self.ram[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
         Ok(())
+    }
+
+    /// SPI1 in an SD session (CON b3, fm1_sd_bus.h): a BUF write clocks one byte through the card (its answer in BUF),
+    /// a CNT write n bytes by DMA, received into RAM (CON b12) or sent from it. The card is selected while PC7 (the
+    /// LCD's CS, through the SD board's inverter) is driven high; bytes clocked while it is not go to the LCD as data
+    /// after the NOP the firmware sends first, which the panel ignores: dropped here. false: not the card's transfer.
+    fn sd_transfer(&mut self, address: u32, value: u32) -> Result<bool, AccessFault> {
+        let con = self.lcd.read(SPI).unwrap();
+        if self.sd.is_none() || con & 8 == 0 || (address != SPI + 8 && address != SPI + 16) {
+            return Ok(false);
+        }
+        let pc_out = self.devices.gpio.read(0x50080).unwrap();
+        let pc_dir = self.devices.gpio.read(0x50088).unwrap();
+        let on = pc_dir & 0x80 == 0 && pc_out & 0x80 != 0;
+        let sd = self.sd.as_mut().unwrap();
+        sd.select(on);
+        if address == SPI + 8 {
+            let r = if on { sd.xchg(value as u8) } else { 0xFF };
+            self.lcd.sd_store(address, r as u32);
+            return Ok(true);
+        }
+        let at = self.lcd.dma_address();
+        let n = value as usize;
+        let offset = Self::offset(at, n, RAM, self.ram.len())
+            .ok_or_else(|| Self::fault(at, n, "DMA", "SD DMA buffer must be in SRAM"))?;
+        for i in 0..n {
+            if con & 0x1000 != 0 {
+                self.ram[offset + i] = if on { sd.xchg(0xFF) } else { 0xFF };
+            } else if on {
+                sd.xchg(self.ram[offset + i]);
+            }
+        }
+        self.lcd.sd_store(address, value);
+        Ok(true)
     }
 
     /// The peripheral (LSB), core and UART clocks the guest selected.

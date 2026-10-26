@@ -95,6 +95,7 @@ pub(crate) enum Wide {
     DivideWide,
     ShiftWideRegister,
     ShiftWideImmediate,
+    RotateWideImmediate,
     Divide,
     CountLeadingZeros,
     Absolute,
@@ -421,6 +422,12 @@ fn wide(h: u32, x: u32) -> Wide {
     }
     if h == 0xe1d0 && d & 1 == 0 && s == 0 && (x >> 10) & 3 != 1 {
         return Wide::ShiftWideImmediate;
+    }
+    if h == 0xe1d4 && d & 1 == 0 && s == 0 && (x >> 10) & 3 == 0 {
+        // Vendor objdump `r5_r4 <>= 33`: a register pair rotated right, the amount encoded as
+        // ShiftWideImmediate's. Right, not left: clang emits XXH64's rotl 31 / 27 / 23 / 18 / 12 / 11 / 7 / 1
+        // as <>= 33 / 37 / 41 / 46 / 52 / 53 / 57 / 63 (Optimist's storage/sd/sd_hash.c).
+        return Wide::RotateWideImmediate;
     }
     if h == 0xe1f4 && x & 15 <= 1 {
         return Wide::Divide;

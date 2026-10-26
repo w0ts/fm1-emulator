@@ -332,6 +332,23 @@ fn pair_shifts_sign_extend_and_scale_sixty_four_bit_products() {
 }
 
 #[test]
+fn pair_rotate_right_is_xxh64s_rotate_left() {
+    // Optimist's SD build (storage/sd/sd_hash.c, XXH64): e1d4 4201 is r5_r4 <>= 33, a rotate right of
+    // the pair: its rotl(x, 31). The immediate is encoded as e1d0's.
+    let mut c = cpu(&[0xe1d4, 0x4201, 0xe1d4, 0x830f]);
+    let x: u64 = 0x9E37_79B1_85EB_CA87;
+    c.r[4] = x as u32;
+    c.r[5] = (x >> 32) as u32;
+    c.step().unwrap();
+    assert_eq!((c.r[5] as u64) << 32 | c.r[4] as u64, x.rotate_left(31));
+    c.r[8] = x as u32;
+    c.r[9] = (x >> 32) as u32;
+    c.step().unwrap();
+    assert_eq!((c.r[9] as u64) << 32 | c.r[8] as u64, x.rotate_right(63), "r9_r8 <>= 63: rotl 1");
+    assert_eq!(c.pc, XIP + 8);
+}
+
+#[test]
 fn pair_shift_by_register_normalises_a_double_mantissa() {
     // FM-1_093 unsigned-to-double at 0x02045210: e1d8 4700 = r5:r4 <<= r7
     // with r7 = 52 - (bit length 6 of 48) + 1 = 47, after which

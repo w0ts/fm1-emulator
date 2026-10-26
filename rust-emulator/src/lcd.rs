@@ -77,6 +77,13 @@ impl Lcd {
         self.registers[3]
     }
 
+    /// The SD card's side of SPI1 (sd.rs, bus.rs): a register stored without a panel transfer (BUF: the byte the
+    /// card returned), then the transfer marked complete (CON b15).
+    pub(crate) fn sd_store(&mut self, address: u32, value: u32) {
+        self.registers[((address - SPI) / 4) as usize] = value;
+        self.registers[0] |= 0x8000;
+    }
+
     pub fn write(
         &mut self,
         address: u32,
@@ -144,6 +151,9 @@ impl Lcd {
                 0x2c => self.cursor = [self.columns[0], self.rows[0]],
                 // Inversion is the panel's electrical drive mode. RGB565 values
                 // represent visible colors for the FM-1's normal INVON setup.
+                // NOP: ends a memory write; data after it, with no command waiting, is ignored
+                // [ST7789V datasheet, NOP / RAMWR] (Optimist's SD mod: sd_begin sends it before the card's session).
+                0x00 => (),
                 0x13 | 0x20 | 0x21 | 0x2a | 0x2b | 0x36 | 0x3a => (),
                 c if Self::configuration_length(c).is_some() => (),
                 _ => return Err("unsupported LCD command"),
@@ -222,6 +232,7 @@ impl Lcd {
                     }
                     self.panel_configuration[c as usize].clone_from(&self.args);
                 }
+                0x00 => self.args.clear(),
                 _ => return Err("unsupported LCD data or pixel orientation"),
             }
         }
