@@ -942,19 +942,27 @@ impl Bus {
     /// SPI1 in an SD session (CON b3, fm1_sd_bus.h): a BUF write clocks one byte through the card (its answer in BUF),
     /// a CNT write n bytes by DMA, received into RAM (CON b12) or sent from it. The card is selected while PC7 (the
     /// LCD's CS, through the SD board's inverter) is driven high; bytes clocked while it is not go to the LCD as data
-    /// after the NOP the firmware sends first, which the panel ignores: dropped here. false: not the card's transfer.
+    /// after the NOP the firmware sends first, which the panel ignores: dropped here. With no card (no --sd) every
+    /// byte reads 0xFF, an empty slot. false: not the card's transfer.
     fn sd_transfer(&mut self, address: u32, value: u32) -> Result<bool, AccessFault> {
         let con = self.lcd.read(SPI).unwrap();
-        if self.sd.is_none() || con & 8 == 0 || (address != SPI + 8 && address != SPI + 16) {
+        if con & 8 == 0 || (address != SPI + 8 && address != SPI + 16) {
             return Ok(false);
         }
+        // (no card in the slot: DO pulled up, every byte 0xFF, as the firmware's probe expects of an empty slot)
         let pc_out = self.devices.gpio.read(0x50080).unwrap();
         let pc_dir = self.devices.gpio.read(0x50088).unwrap();
-        let on = pc_dir & 0x80 == 0 && pc_out & 0x80 != 0;
-        let sd = self.sd.as_mut().unwrap();
-        sd.select(on);
+        let mut on = pc_dir & 0x80 == 0 && pc_out & 0x80 != 0;
+        if let Some(sd) = self.sd.as_mut() {
+            sd.select(on);
+        } else {
+            on = false;
+        }
         if address == SPI + 8 {
-            let r = if on { sd.xchg(value as u8) } else { 0xFF };
+            let r = match self.sd.as_mut() {
+                Some(sd) if on => sd.xchg(value as u8),
+                _ => 0xFF,
+            };
             self.lcd.sd_store(address, r as u32);
             return Ok(true);
         }
@@ -963,10 +971,16 @@ impl Bus {
         let offset = Self::offset(at, n, RAM, self.ram.len())
             .ok_or_else(|| Self::fault(at, n, "DMA", "SD DMA buffer must be in SRAM"))?;
         for i in 0..n {
-            if con & 0x1000 != 0 {
-                self.ram[offset + i] = if on { sd.xchg(0xFF) } else { 0xFF };
-            } else if on {
-                sd.xchg(self.ram[offset + i]);
+            match self.sd.as_mut() {
+                Some(sd) if on => {
+                    if con & 0x1000 != 0 {
+                        self.ram[offset + i] = sd.xchg(0xFF);
+                    } else {
+                        sd.xchg(self.ram[offset + i]);
+                    }
+                }
+                _ if con & 0x1000 != 0 => self.ram[offset + i] = 0xFF,
+                _ => (),
             }
         }
         self.lcd.sd_store(address, value);
