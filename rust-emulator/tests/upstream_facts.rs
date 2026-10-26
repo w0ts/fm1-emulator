@@ -27,7 +27,10 @@ fn pair(c: &Cpu, low: usize) -> u64 {
 
 fn byte_store_negative(base: u16, source: u16, offset: i32) -> [u16; 2] {
     let imm = (offset + 256) as u16;
-    [0xee53, source << 12 | (imm & 0xf0) << 4 | base << 4 | (imm & 15)]
+    [
+        0xee53,
+        source << 12 | (imm & 0xf0) << 4 | base << 4 | (imm & 15),
+    ]
 }
 
 #[test]
@@ -42,7 +45,8 @@ fn negative_offset_byte_stores_keep_neighbours_registers_and_flags() {
         c.r[0] = base;
         c.r[8] = 0x123456a5;
         c.sr[5] = 0x89abcde5;
-        c.step().unwrap_or_else(|e| panic!("offset {offset}: {e:?}"));
+        c.step()
+            .unwrap_or_else(|e| panic!("offset {offset}: {e:?}"));
         let expected = 0x443322a5u32;
         let stored = c.bus.read(DATA + 16, 4).unwrap();
         assert_eq!(stored, expected, "offset {offset}");

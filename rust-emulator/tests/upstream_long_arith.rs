@@ -32,7 +32,8 @@ fn signed_long_divide_matches_the_fm1() {
         c.r[1] = (dividend >> 32) as u32;
         c.r[2] = divisor as u32;
         c.sr[5] = 0xf;
-        c.step().unwrap_or_else(|e| panic!("{dividend}/{divisor}: {e:?}"));
+        c.step()
+            .unwrap_or_else(|e| panic!("{dividend}/{divisor}: {e:?}"));
         assert_eq!(pair(&c, 0) as i64, quotient, "{dividend} / {divisor}");
     }
 }
@@ -72,7 +73,9 @@ fn long_multiply_accumulate_sets_only_the_64_bit_carry() {
         c.step().unwrap();
         assert_eq!(pair(&c, 10), result, "{accumulator:#x} + {left} * {right}");
         let expected = 0x8000_000d | if carry { 2 } else { 0 };
-        assert_eq!(c.sr[5], expected, "flags for {accumulator:#x} + {left} * {right}");
+        assert_eq!(
+            c.sr[5], expected,
+            "flags for {accumulator:#x} + {left} * {right}"
+        );
     }
 }
-

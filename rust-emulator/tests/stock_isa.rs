@@ -344,7 +344,11 @@ fn pair_rotate_right_is_xxh64s_rotate_left() {
     c.r[8] = x as u32;
     c.r[9] = (x >> 32) as u32;
     c.step().unwrap();
-    assert_eq!((c.r[9] as u64) << 32 | c.r[8] as u64, x.rotate_right(63), "r9_r8 <>= 63: rotl 1");
+    assert_eq!(
+        (c.r[9] as u64) << 32 | c.r[8] as u64,
+        x.rotate_right(63),
+        "r9_r8 <>= 63: rotl 1"
+    );
     assert_eq!(c.pc, XIP + 8);
 }
 

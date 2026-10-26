@@ -51,7 +51,11 @@ fn crc16(p: &[u8]) -> u16 {
     for &b in p {
         c ^= (b as u16) << 8;
         for _ in 0..8 {
-            c = if c & 0x8000 != 0 { (c << 1) ^ 0x1021 } else { c << 1 };
+            c = if c & 0x8000 != 0 {
+                (c << 1) ^ 0x1021
+            } else {
+                c << 1
+            };
         }
     }
     c
@@ -289,7 +293,8 @@ impl SdCard {
     fn write_back(&mut self, s: u32) {
         let at = s as usize * 512;
         if let Some(f) = self.file.as_mut() {
-            let ok = f.seek(SeekFrom::Start(at as u64)).is_ok() && f.write_all(&self.img[at..at + 512]).is_ok();
+            let ok = f.seek(SeekFrom::Start(at as u64)).is_ok()
+                && f.write_all(&self.img[at..at + 512]).is_ok();
             if !ok {
                 eprintln!("SD image: block {s} not written back");
             }
@@ -396,7 +401,14 @@ mod tests {
     use super::*;
 
     fn cmd(c: &mut SdCard, idx: u8, arg: u32) -> Vec<u8> {
-        let mut f = [0x40 | idx, (arg >> 24) as u8, (arg >> 16) as u8, (arg >> 8) as u8, arg as u8, 0];
+        let mut f = [
+            0x40 | idx,
+            (arg >> 24) as u8,
+            (arg >> 16) as u8,
+            (arg >> 8) as u8,
+            arg as u8,
+            0,
+        ];
         f[5] = crc7(&f[..5]);
         for b in f {
             c.xchg(b);
@@ -413,7 +425,11 @@ mod tests {
         c.select(true);
         assert_eq!(r1(&cmd(&mut c, 0, 0)), 0x01, "CMD0: idle");
         let r = cmd(&mut c, 8, 0x1AA);
-        assert_eq!(&r[1..6], &[0x01, 0, 0, 0x01, 0xAA], "CMD8: the pattern back");
+        assert_eq!(
+            &r[1..6],
+            &[0x01, 0, 0, 0x01, 0xAA],
+            "CMD8: the pattern back"
+        );
         cmd(&mut c, 55, 0);
         assert_eq!(r1(&cmd(&mut c, 41, 1 << 30)), 0x00, "ACMD41: ready");
         assert_eq!(r1(&cmd(&mut c, 59, 1)), 0x00, "CMD59: CRC on");
@@ -459,7 +475,10 @@ mod tests {
             }
         }
         assert_eq!(&got[..512], &img[3 * 512..4 * 512], "CMD17: sector 3");
-        assert_eq!(u16::from_be_bytes([got[512], got[513]]), crc16(&img[3 * 512..4 * 512]));
+        assert_eq!(
+            u16::from_be_bytes([got[512], got[513]]),
+            crc16(&img[3 * 512..4 * 512])
+        );
         // CMD18 from 10: two blocks, then CMD12
         let mut f = [0x52, 0, 0, 0, 10, 0];
         f[5] = crc7(&f[..5]);
@@ -505,7 +524,11 @@ mod tests {
         for _ in 0..3 {
             c.xchg(0xFF);
         }
-        assert_eq!(write_block(&mut c, 0xFE, &a) & 0x1F, 0x05, "CMD24: accepted");
+        assert_eq!(
+            write_block(&mut c, 0xFE, &a) & 0x1F,
+            0x05,
+            "CMD24: accepted"
+        );
         assert_eq!(&c.image()[5 * 512..6 * 512], &a[..]);
         // CMD25 at 100, the card deselected between the blocks
         let mut f = [0x59, 0, 0, 0, 100, 0];
@@ -518,13 +541,19 @@ mod tests {
         }
         for k in 0..3u8 {
             let d = vec![k + 1; 512];
-            assert_eq!(write_block(&mut c, 0xFC, &d) & 0x1F, 0x05, "CMD25 block {k}");
+            assert_eq!(
+                write_block(&mut c, 0xFC, &d) & 0x1F,
+                0x05,
+                "CMD25 block {k}"
+            );
             c.select(false);
             c.select(true);
         }
         c.xchg(0xFD);
         for k in 0..3usize {
-            assert!(c.image()[(100 + k) * 512..(101 + k) * 512].iter().all(|&b| b == k as u8 + 1));
+            assert!(c.image()[(100 + k) * 512..(101 + k) * 512]
+                .iter()
+                .all(|&b| b == k as u8 + 1));
         }
         assert_eq!(c.blocks_written, 4);
     }

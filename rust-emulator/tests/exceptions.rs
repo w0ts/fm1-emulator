@@ -88,7 +88,10 @@ fn integer_divides_by_zero_trap_when_armed_and_fault_otherwise() {
             unarmed.step().unwrap();
             assert_eq!((unarmed.r[0], unarmed.r[1]), (0, 0));
         } else {
-            assert!(unarmed.step().is_err(), "unarmed: the quotient is unmeasured");
+            assert!(
+                unarmed.step().is_err(),
+                "unarmed: the quotient is unmeasured"
+            );
         }
     }
 }

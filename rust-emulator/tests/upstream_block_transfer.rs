@@ -37,7 +37,10 @@ fn register_sum_store_has_no_writeback() {
     c.r[0] = 0xaabbccdd;
     c.r[1] = 0x55667788;
     c.step().unwrap();
-    assert_eq!((word(&c, DATA + 8), word(&c, DATA + 12)), (0xaabbccdd, 0x55667788));
+    assert_eq!(
+        (word(&c, DATA + 8), word(&c, DATA + 12)),
+        (0xaabbccdd, 0x55667788)
+    );
     assert_eq!((c.r[3], c.r[2]), (DATA, 8));
 }
 
@@ -51,7 +54,10 @@ fn register_sum_store_scales_the_index_by_eight() {
     c.r[0] = 0xaabbccdd;
     c.r[1] = 0x55667788;
     c.step().unwrap();
-    assert_eq!((word(&c, DATA + 8), word(&c, DATA + 12)), (0xaabbccdd, 0x55667788));
+    assert_eq!(
+        (word(&c, DATA + 8), word(&c, DATA + 12)),
+        (0xaabbccdd, 0x55667788)
+    );
 }
 
 #[test]
@@ -111,7 +117,10 @@ fn store_post_increment_charges_the_count() {
     c.r[2] = 0xaabbccdd;
     c.r[3] = 0x55667788;
     c.step().unwrap();
-    assert_eq!((word(&c, DATA), word(&c, DATA + 4)), (0xaabbccdd, 0x55667788));
+    assert_eq!(
+        (word(&c, DATA), word(&c, DATA + 4)),
+        (0xaabbccdd, 0x55667788)
+    );
     assert_eq!(c.r[1], DATA + 8);
 }
 
@@ -122,7 +131,10 @@ fn store_pre_decrement_captures_the_incoming_registers() {
     c.r[1] = DATA + 16;
     c.r[2] = 0xaabbccdd;
     c.step().unwrap();
-    assert_eq!((word(&c, DATA + 8), word(&c, DATA + 12)), (DATA + 16, 0xaabbccdd));
+    assert_eq!(
+        (word(&c, DATA + 8), word(&c, DATA + 12)),
+        (DATA + 16, 0xaabbccdd)
+    );
     assert_eq!(c.r[1], DATA + 8);
 }
 
@@ -142,7 +154,10 @@ fn store_below_the_base_has_no_writeback() {
     c.r[2] = 0xaabbccdd;
     c.r[3] = 0x55667788;
     c.step().unwrap();
-    assert_eq!((word(&c, DATA), word(&c, DATA + 4)), (0xaabbccdd, 0x55667788));
+    assert_eq!(
+        (word(&c, DATA), word(&c, DATA + 4)),
+        (0xaabbccdd, 0x55667788)
+    );
     assert_eq!(c.r[1], DATA + 8);
 }
 

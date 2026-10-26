@@ -85,7 +85,11 @@ fn register_list(cpu: &mut Cpu, h: u32, x: u32, store: bool) -> Step<()> {
     } else {
         incoming
     };
-    let end = if h & 0x40 != 0 { start } else { incoming.wrapping_add(span) };
+    let end = if h & 0x40 != 0 {
+        start
+    } else {
+        incoming.wrapping_add(span)
+    };
     let writeback = h & 0x10 != 0;
     if writeback && !store {
         cpu.r[base] = end;

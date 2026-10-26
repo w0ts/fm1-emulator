@@ -132,12 +132,19 @@ fn print_levels(player: &mut Player, seconds: f64) -> Result<(), String> {
         }
         for (id, slot) in range.iter_mut().enumerate() {
             let [lo, hi, flo, fhi] = slot.unwrap_or([f32::MAX, 0., f32::MAX, 0.]);
-            *slot = Some([lo.min(raw[id]), hi.max(raw[id]), flo.min(level[id]), fhi.max(level[id])]);
+            *slot = Some([
+                lo.min(raw[id]),
+                hi.max(raw[id]),
+                flo.min(level[id]),
+                fhi.max(level[id]),
+            ]);
         }
     }
     for (id, slot) in range.iter().enumerate() {
         if let Some([lo, hi, flo, fhi]) = slot.filter(|r| r[1] > 0.) {
-            let name = BUTTONS.get(id).map_or(format!("key{}", id.wrapping_sub(14)), |n| n.to_string());
+            let name = BUTTONS
+                .get(id)
+                .map_or(format!("key{}", id.wrapping_sub(14)), |n| n.to_string());
             println!("  {name:6} raw {lo:.3}..{hi:.3} (spread {:.3})  filtered {flo:.3}..{fhi:.3} (spread {:.3})", hi - lo, fhi - flo);
         }
     }

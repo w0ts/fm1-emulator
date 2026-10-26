@@ -1739,7 +1739,10 @@ mod tests {
             sd: None,
         };
         assert_eq!(parse(&["a.fwsc"]), Ok(args(None, None)));
-        assert_eq!(parse(&["--sd", "card.img", "a.fwsc"]).unwrap().sd, Some(PathBuf::from("card.img")));
+        assert_eq!(
+            parse(&["--sd", "card.img", "a.fwsc"]).unwrap().sd,
+            Some(PathBuf::from("card.img"))
+        );
         assert!(parse(&["a.fwsc", "--sd"]).is_err());
         assert_eq!(
             parse(&["--cpu-mhz", "24", "a.fwsc"]),

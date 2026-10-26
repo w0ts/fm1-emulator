@@ -315,7 +315,8 @@ mod tests {
                     let lit = (ticks as f32 * duty(self.frame)) as u32;
                     self.leds.update(!(1 << column), 0);
                     self.leds.advance(ticks as u32 - lit);
-                    self.leds.update(!(1 << column), if column == 5 { 1 } else { 0 });
+                    self.leds
+                        .update(!(1 << column), if column == 5 { 1 } else { 0 });
                     self.leds.advance(lit);
                 }
                 self.leds.update(u16::MAX, 0);
@@ -351,7 +352,11 @@ mod tests {
     fn a_frame_in_four_reads_a_quarter_and_full_on_reads_one() {
         let mut rig = Rig::new();
         rig.run(1000, |frame| if frame % 4 == 0 { 1. } else { 0. });
-        assert!(rig.level[10..].iter().all(|l| (l - 0.25).abs() < 0.04), "{:?}", rig.level);
+        assert!(
+            rig.level[10..].iter().all(|l| (l - 0.25).abs() < 0.04),
+            "{:?}",
+            rig.level
+        );
         let mut rig = Rig::new();
         rig.run(500, |_| 1.);
         assert!(rig.level.iter().all(|&l| l == 1.), "{:?}", rig.level);
@@ -377,6 +382,10 @@ mod tests {
         assert!(*rig.level.last().unwrap() > 0.95);
         // (Full to dim is followed by the average: settled to a quarter within half a second.)
         rig.run(500, |frame| if frame % 4 == 0 { 1. } else { 0. });
-        assert!((*rig.level.last().unwrap() - 0.25).abs() < 0.04, "{:?}", rig.level);
+        assert!(
+            (*rig.level.last().unwrap() - 0.25).abs() < 0.04,
+            "{:?}",
+            rig.level
+        );
     }
 }
